@@ -13,6 +13,9 @@ interface ChatWindowProps {
   input: string;
   onInputChange: (value: string) => void;
   onSend: () => void;
+  fileName: string | null;
+  onFileChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  onClearFile: () => void;
   onKeyDown: (e: React.KeyboardEvent<HTMLInputElement>) => void;
 }
 
@@ -22,6 +25,9 @@ export function ChatWindow({
   input,
   onInputChange,
   onSend,
+  fileName,
+  onFileChange,
+  onClearFile,
   onKeyDown,
 }: ChatWindowProps) {
   return (
@@ -75,22 +81,49 @@ export function ChatWindow({
 
       {/* 底部输入栏 */}
       <div className="shrink-0 border-t border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-4">
-        <div className="mx-auto flex max-w-3xl gap-3">
-          <input
-            className="flex-1 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/80 px-4 py-3 text-sm text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-shadow"
-            placeholder="输入消息..."
-            value={input}
-            onChange={(e) => onInputChange(e.target.value)}
-            onKeyDown={onKeyDown}
-            disabled={isLoading}
-          />
-          <button
-            onClick={onSend}
-            disabled={isLoading}
-            className="shrink-0 rounded-xl bg-blue-500 px-6 py-3 text-sm font-medium text-white hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm"
-          >
-            {isLoading ? '...' : '发送'}
-          </button>
+        <div className="mx-auto max-w-3xl space-y-2">
+          {fileName && (
+            <div className="flex items-center justify-between rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-200">
+              <span className="truncate">已挂载文档：{fileName}</span>
+              <button
+                type="button"
+                onClick={onClearFile}
+                className="ml-3 text-[11px] hover:underline"
+              >
+                移除
+              </button>
+            </div>
+          )}
+          <div className="flex gap-3">
+            <input
+              className="flex-1 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/80 px-4 py-3 text-sm text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-shadow"
+              placeholder="输入消息..."
+              value={input}
+              onChange={(e) => onInputChange(e.target.value)}
+              onKeyDown={onKeyDown}
+              disabled={isLoading}
+            />
+            <button
+              onClick={onSend}
+              disabled={isLoading}
+              className="shrink-0 rounded-xl bg-blue-500 px-6 py-3 text-sm font-medium text-white hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm"
+            >
+              {isLoading ? '...' : '发送'}
+            </button>
+          </div>
+          <div className="flex items-center justify-between text-[11px] text-zinc-400">
+            <label className="inline-flex cursor-pointer items-center gap-1 rounded-full px-2 py-1 hover:bg-zinc-100 dark:hover:bg-zinc-800">
+              <span className="text-xs text-zinc-500 dark:text-zinc-400">
+                选择本地文档（.txt / .md / .pdf）
+              </span>
+              <input
+                type="file"
+                accept=".txt,.md,.pdf"
+                className="hidden"
+                onChange={onFileChange}
+              />
+            </label>
+          </div>
         </div>
       </div>
     </div>

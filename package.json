@@ -10,10 +10,12 @@
   },
   "dependencies": {
     "@radix-ui/react-select": "^2.2.6",
+    "all": "^0.0.0",
     "highlight.js": "^11.11.1",
     "katex": "^0.16.33",
     "next": "16.1.6",
     "ollama": "^0.6.3",
+    "pdfjs-dist": "^5.5.207",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "react-markdown": "^10.1.0",

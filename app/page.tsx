@@ -85,6 +85,8 @@ export default function Home() {
   const [systemPrompt, setSystemPrompt] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [isHydrated, setIsHydrated] = useState(false);
+  const [fileName, setFileName] = useState<string | null>(null);
+  const [fileContent, setFileContent] = useState('');
 
   useEffect(() => {
     const data = loadFromStorage();
@@ -178,6 +180,9 @@ export default function Home() {
     };
     setConversations((prev) => [newConv, ...prev]);
     setCurrentId(newConv.id);
+    // 新对话默认不挂载旧文档
+    setFileName(null);
+    setFileContent('');
   }, []);
 
   const deleteConversation = useCallback(
@@ -224,10 +229,16 @@ export default function Home() {
     setCurrentId(activeId);
     setIsLoading(true);
 
+    const trimmedSystem = systemPrompt.trim();
+    const contextPrefix = fileContent
+      ? `请根据以下资料回答问题：\n${fileContent}\n\n`
+      : '';
+    const effectiveSystem = (contextPrefix + trimmedSystem).trim();
+
     const messagesToSend =
-      systemPrompt.trim() === ''
+      effectiveSystem === ''
         ? newMessages
-        : [{ role: 'system', content: systemPrompt.trim() }, ...newMessages];
+        : [{ role: 'system', content: effectiveSystem }, ...newMessages];
 
     try {
       const res = await fetch('/api/chat', {
@@ -284,11 +295,58 @@ export default function Home() {
       }
     } finally {
       setIsLoading(false);
+      // 单轮问答级别的文档挂载，用完即清理
+      setFileName(null);
+      setFileContent('');
     }
   };
 
   const handleSendFromInput = () => {
     if (input.trim() && !isLoading) send();
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const inputEl = e.target;
+    const file = inputEl.files?.[0];
+    if (!file) return;
+    try {
+      let text = '';
+      if (/\.pdf$/i.test(file.name)) {
+        const pdfjs = await import('pdfjs-dist');
+        if (typeof window !== 'undefined') {
+          pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
+        }
+        const arrayBuffer = await file.arrayBuffer();
+        const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
+        let fullText = '';
+        for (let i = 1; i <= pdf.numPages; i += 1) {
+          const page = await pdf.getPage(i);
+          const textContent = await page.getTextContent();
+          const pageText = (textContent.items as any[])
+            .map((item) => item.str)
+            .join(' ');
+          fullText += `${pageText}\n`;
+        }
+        text = fullText;
+      } else if (/\.(txt|md)$/i.test(file.name)) {
+        text = await file.text();
+      } else {
+        setFileName(null);
+        setFileContent('');
+        inputEl.value = '';
+        return;
+      }
+      setFileName(file.name);
+      setFileContent(text);
+    } finally {
+      // 允许选择同一个文件时也能触发 onChange
+      inputEl.value = '';
+    }
+  };
+
+  const clearFile = () => {
+    setFileName(null);
+    setFileContent('');
   };
 
   if (!isHydrated) {
@@ -349,6 +407,9 @@ export default function Home() {
           input={input}
           onInputChange={setInput}
           onSend={handleSendFromInput}
+          fileName={fileName}
+          onFileChange={handleFileChange}
+          onClearFile={clearFile}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault();

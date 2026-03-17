@@ -4,7 +4,7 @@ import { NextResponse } from 'next/server';
 
 export async function POST(req: Request) {
   try {
-    const { messages, model = 'deepseek-r1' } = await req.json();
+    const { messages, model = 'deepseek-r1', options } = await req.json();
     if (!messages?.length) {
       return NextResponse.json({ error: 'messages 不能为空' }, { status: 400 });
     }
@@ -12,6 +12,7 @@ export async function POST(req: Request) {
     const response = await ollama.chat({
       model,
       messages,
+      ...(options ? { options } : {}),
       stream: true,
     });
 

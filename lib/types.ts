@@ -9,3 +9,12 @@ export interface Conversation {
   messages: Message[];
   titleGenerated?: boolean;
 }
+
+export interface DocItem {
+  id: string;
+  name: string;
+  content: string;
+  kind: 'txt' | 'md' | 'pdf';
+  objectUrl?: string;
+  checked: boolean;
+}

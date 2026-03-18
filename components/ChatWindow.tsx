@@ -1,5 +1,6 @@
 'use client';
 
+import React from 'react';
 import { MarkdownContent } from '@/components/MarkdownContent';
 import type { DocItem } from '@/lib/types';
 
@@ -21,6 +22,16 @@ interface ChatWindowProps {
   onToggleDoc: (id: string) => void;
   onRemoveDoc: (id: string) => void;
   isContextTooLong: boolean;
+  ragEnabled: boolean;
+  ragHits: Array<{
+    docId: string;
+    docName: string;
+    chunk: string;
+    score: number;
+    pageStart?: number;
+    pageEnd?: number;
+    heading?: string;
+  }>;
   onKeyDown: (e: React.KeyboardEvent<HTMLInputElement>) => void;
 }
 
@@ -37,9 +48,41 @@ export function ChatWindow({
   onToggleDoc,
   onRemoveDoc,
   isContextTooLong,
+  ragEnabled,
+  ragHits,
   onKeyDown,
 }: ChatWindowProps) {
   const activeDoc = docs.find((d) => d.id === activeDocId) ?? null;
+  const [pdfPage, setPdfPage] = React.useState<number | null>(null);
+  const [activeHitIdx, setActiveHitIdx] = React.useState<number | null>(null);
+
+  const activeHit =
+    activeHitIdx != null && ragHits[activeHitIdx] ? ragHits[activeHitIdx] : null;
+
+  React.useEffect(() => {
+    // 切换文档时重置跳转页，避免 iframe 无感刷新
+    setPdfPage(null);
+    setActiveHitIdx(null);
+  }, [activeDocId]);
+
+  const escapeHtml = (s: string) =>
+    s
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/\"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+
+  const highlightOnce = (text: string, snippet: string) => {
+    const s = snippet.trim().slice(0, 120);
+    if (!s) return escapeHtml(text);
+    const idx = text.indexOf(s);
+    if (idx < 0) return escapeHtml(text);
+    const before = escapeHtml(text.slice(0, idx));
+    const mid = escapeHtml(s);
+    const after = escapeHtml(text.slice(idx + s.length));
+    return `${before}<mark class="bg-yellow-200/70 dark:bg-yellow-400/30 rounded px-0.5">${mid}</mark>${after}`;
+  };
   return (
     <div className="flex min-h-0 flex-1 min-w-0 overflow-hidden">
       {/* 左侧：聊天 */}
@@ -135,14 +178,14 @@ export function ChatWindow({
               />
             </label>
           </div>
-          {isContextTooLong && (
+          {isContextTooLong && !ragEnabled && (
             <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-700 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-200">
               内容过长（已选文档超 5000 字），建议在设置中开启 RAG 模式
             </div>
           )}
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto p-2">
+        <div className="h-44 overflow-y-auto p-2">
           {docs.length === 0 ? (
             <div className="p-4 text-center text-xs text-zinc-400">
               还没有上传文档
@@ -208,25 +251,81 @@ export function ChatWindow({
         </div>
 
         <div className="min-h-0 flex-1 border-t border-zinc-200 dark:border-zinc-800">
-          <div className="px-4 py-2 text-xs font-medium text-zinc-500 dark:text-zinc-400">
-            预览
+          <div className="px-4 py-2 flex items-center justify-between">
+            <div className="text-xs font-medium text-zinc-500 dark:text-zinc-400">
+              预览与引用
+            </div>
+            {activeDoc?.kind === 'pdf' && pdfPage && (
+              <div className="text-[11px] text-zinc-400">页码：p{pdfPage}</div>
+            )}
           </div>
-          <div className="h-[calc(100%-2.25rem)] px-2 pb-2">
+          <div className="h-[calc(100%-2.25rem)] px-2 pb-2 flex flex-col gap-2">
+            {ragHits.length > 0 && (
+              <div className="rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/40 p-2">
+                <div className="mb-1 text-[11px] font-medium text-zinc-500 dark:text-zinc-400">
+                  命中引用（点击高亮 / 跳转）
+                </div>
+                <div className="max-h-32 overflow-auto space-y-1">
+                  {ragHits.slice(0, 8).map((h, idx) => (
+                    <button
+                      key={`${h.docId}-${idx}`}
+                      type="button"
+                      onClick={() => {
+                        setActiveHitIdx(idx);
+                        onSetActiveDoc(h.docId);
+                        if (h.pageStart) setPdfPage(h.pageStart);
+                      }}
+                      className={`w-full text-left rounded-md px-2 py-1 text-[11px] transition-colors ${
+                        activeHitIdx === idx
+                          ? 'bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700'
+                          : 'hover:bg-white/60 dark:hover:bg-zinc-900/50'
+                      }`}
+                      title={h.docName}
+                    >
+                      <div className="truncate text-zinc-700 dark:text-zinc-200">
+                        {h.docName}
+                        {h.pageStart
+                          ? ` · p${h.pageStart}${
+                              h.pageEnd && h.pageEnd !== h.pageStart
+                                ? `-${h.pageEnd}`
+                                : ''
+                            }`
+                          : ''}
+                        {h.heading ? ` · ${h.heading}` : ''}
+                      </div>
+                      <div className="truncate text-zinc-400">
+                        score={h.score.toFixed(3)} · {h.chunk.slice(0, 60)}…
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
             {!activeDoc ? (
               <div className="h-full rounded-lg border border-dashed border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/40 flex items-center justify-center text-xs text-zinc-400">
                 点击上面已上传文档以查看内容
               </div>
             ) : activeDoc.kind === 'pdf' && activeDoc.objectUrl ? (
               <iframe
+                key={`${activeDoc.objectUrl}-${pdfPage ?? 'top'}`}
                 title={activeDoc.name}
-                src={activeDoc.objectUrl}
+                src={`${activeDoc.objectUrl}${pdfPage ? `#page=${pdfPage}` : ''}`}
                 className="h-full w-full rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white"
               />
             ) : (
               <div className="h-full overflow-auto rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-3">
-                <pre className="whitespace-pre-wrap break-words text-xs text-zinc-700 dark:text-zinc-200">
-                  {activeDoc.content.slice(0, 20000)}
-                </pre>
+                <pre
+                  className="whitespace-pre-wrap break-words text-xs text-zinc-700 dark:text-zinc-200"
+                  dangerouslySetInnerHTML={{
+                    __html:
+                      activeHit && activeHit.docId === activeDoc.id
+                        ? highlightOnce(
+                            activeDoc.content.slice(0, 20000),
+                            activeHit.chunk,
+                          )
+                        : escapeHtml(activeDoc.content.slice(0, 20000)),
+                  }}
+                />
               </div>
             )}
           </div>

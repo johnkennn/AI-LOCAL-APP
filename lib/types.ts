@@ -16,5 +16,6 @@ export interface DocItem {
   content: string;
   kind: 'txt' | 'md' | 'pdf';
   objectUrl?: string;
+  pages?: Array<{ page: number; text: string }>;
   checked: boolean;
 }

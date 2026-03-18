@@ -1,7 +1,13 @@
 import { NextResponse } from 'next/server';
 import crypto from 'node:crypto';
 
-type Doc = { id: string; name: string; content: string };
+type Doc = {
+  id: string;
+  name: string;
+  content: string;
+  kind?: 'txt' | 'md' | 'pdf';
+  pages?: Array<{ page: number; text: string }>;
+};
 
 // embedding 模型的上下文通常较短；字符数过大容易触发
 // {"error":"the input length exceeds the context length"}
@@ -19,16 +25,122 @@ function safeForEmbedding(text: string): string {
   return clean.slice(0, MAX_EMBED_CHARS);
 }
 
-function splitText(text: string, chunkSize = 900, overlap = 150): string[] {
-  const clean = text.replace(/\r\n/g, '\n').trim();
-  if (!clean) return [];
-  const chunks: string[] = [];
-  const step = Math.max(1, chunkSize - overlap);
-  for (let start = 0; start < clean.length; start += step) {
-    const end = Math.min(clean.length, start + chunkSize);
-    const chunk = clean.slice(start, end).trim();
-    if (chunk) chunks.push(chunk);
-    if (end >= clean.length) break;
+type Block = {
+  text: string;
+  heading?: string;
+  page?: number;
+};
+
+type Chunk = {
+  text: string;
+  heading?: string;
+  pageStart?: number;
+  pageEnd?: number;
+};
+
+function splitParagraphs(text: string): string[] {
+  const clean = text.replace(/\r\n/g, '\n');
+  // 优先按空行分段；如果没有空行，再按句号/分号等粗切
+  const byBlank = clean
+    .split(/\n{2,}/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (byBlank.length >= 2) return byBlank;
+  return clean
+    .split(/(?<=[。！？!?；;])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function blocksFromMd(text: string): Block[] {
+  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  const blocks: Block[] = [];
+  let currentHeading: string | undefined;
+  let buf: string[] = [];
+
+  const flush = () => {
+    const joined = buf.join('\n').trim();
+    if (joined) {
+      for (const p of splitParagraphs(joined)) {
+        blocks.push({ text: p, heading: currentHeading });
+      }
+    }
+    buf = [];
+  };
+
+  for (const line of lines) {
+    const m = /^(#{1,6})\s+(.*)$/.exec(line.trim());
+    if (m) {
+      flush();
+      currentHeading = m[2].trim().slice(0, 60);
+      continue;
+    }
+    buf.push(line);
+  }
+  flush();
+  return blocks;
+}
+
+function blocksFromTxt(text: string): Block[] {
+  return splitParagraphs(text).map((p) => ({ text: p }));
+}
+
+function blocksFromPdfPages(pages: Array<{ page: number; text: string }>): Block[] {
+  const blocks: Block[] = [];
+  for (const p of pages) {
+    for (const para of splitParagraphs(p.text || '')) {
+      blocks.push({ text: para, page: p.page });
+    }
+  }
+  return blocks;
+}
+
+function buildChunks(blocks: Block[], chunkSize: number, overlapChars: number): Chunk[] {
+  if (blocks.length === 0) return [];
+  const chunks: Chunk[] = [];
+  let i = 0;
+  while (i < blocks.length) {
+    let size = 0;
+    const start = i;
+    let heading: string | undefined;
+    let pageStart: number | undefined;
+    let pageEnd: number | undefined;
+    const parts: string[] = [];
+
+    while (i < blocks.length) {
+      const b = blocks[i];
+      const t = b.text.trim();
+      if (!t) {
+        i += 1;
+        continue;
+      }
+      const add = (parts.length === 0 ? 0 : 2) + t.length;
+      if (parts.length > 0 && size + add > chunkSize) break;
+      parts.push(t);
+      size += add;
+      heading ||= b.heading;
+      if (typeof b.page === 'number') {
+        pageStart ??= b.page;
+        pageEnd = b.page;
+      }
+      i += 1;
+      if (size >= chunkSize) break;
+    }
+
+    const text = parts.join('\n\n').trim();
+    if (text) chunks.push({ text, heading, pageStart, pageEnd });
+
+    // overlap：按字符预算回退若干 blocks
+    if (i >= blocks.length) break;
+    if (overlapChars <= 0) continue;
+    let back = 0;
+    let backChars = 0;
+    for (let j = i - 1; j >= start; j -= 1) {
+      backChars += blocks[j].text.length;
+      back += 1;
+      if (backChars >= overlapChars) break;
+    }
+    i = Math.max(start + 1, i - back);
   }
   return chunks;
 }
@@ -118,19 +230,35 @@ export async function POST(req: Request) {
     const qVec = await embed(query.trim(), embeddingModel);
 
     const scored: Array<{
+      docId: string;
       docName: string;
       chunk: string;
       score: number;
+      pageStart?: number;
+      pageEnd?: number;
+      heading?: string;
     }> = [];
 
     for (const doc of docs) {
-      const chunks = splitText(doc.content ?? '', safeChunkSize, safeOverlap);
-      for (const chunk of chunks) {
-        const vec = await embed(chunk, embeddingModel);
+      const kind = doc.kind ?? 'txt';
+      const blocks =
+        kind === 'pdf' && doc.pages?.length
+          ? blocksFromPdfPages(doc.pages)
+          : kind === 'md'
+            ? blocksFromMd(doc.content ?? '')
+            : blocksFromTxt(doc.content ?? '');
+
+      const chunks = buildChunks(blocks, safeChunkSize, safeOverlap);
+      for (const ch of chunks) {
+        const vec = await embed(ch.text, embeddingModel);
         scored.push({
+          docId: doc.id,
           docName: doc.name,
-          chunk,
+          chunk: ch.text,
           score: cosineSimilarity(qVec, vec),
+          pageStart: ch.pageStart,
+          pageEnd: ch.pageEnd,
+          heading: ch.heading,
         });
       }
     }

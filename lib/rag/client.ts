@@ -217,7 +217,10 @@ export async function retrieveRagHits(params: {
 }): Promise<RagHit[]> {
   const q = params.query.trim();
   if (!q) return [];
-  const selected = params.docs.filter((d) => d.checked);
+  // 图片需要 OCR 后才有可 embed 的文本；这里仅允许 content>0 的图片参与检索
+  const selected = params.docs.filter(
+    (d) => d.checked && (d.kind !== 'img' || (d.content ?? '').trim().length > 0),
+  );
   if (selected.length === 0) return [];
 
   // 先算 query 向量，再与每个 chunk 向量做余弦相似度

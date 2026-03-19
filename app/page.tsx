@@ -23,6 +23,9 @@ import { retrieveRagHits } from '@/lib/rag/client';
 const LEGACY_STORAGE_KEY = 'ai-local-app-chat';
 const SETTINGS_KEY = 'ai-local-app:settings:v1';
 
+/** 勾选图片提问时使用的视觉模型，固定为 llava（需本机 ollama 已安装）。 */
+const VISION_MODEL = 'llava';
+
 type SettingsState = {
   currentId: string | null;
   model: string;
@@ -33,6 +36,8 @@ type SettingsState = {
   ragChunkSize: number;
   ragOverlap: number;
   embeddingModel: string;
+  leftSidebarOpen: boolean;
+  rightSidebarOpen: boolean;
 };
 
 const DEFAULT_SETTINGS: SettingsState = {
@@ -45,6 +50,8 @@ const DEFAULT_SETTINGS: SettingsState = {
   ragChunkSize: 900,
   ragOverlap: 150,
   embeddingModel: 'mxbai-embed-large',
+  leftSidebarOpen: true,
+  rightSidebarOpen: true,
 };
 
 const MODELS = [
@@ -140,6 +147,8 @@ function loadLegacyBundleFromLocalStorage():
   }
 }
 
+// OCR 能力已移除：图片仅通过视觉模型（VLM）分析处理。
+
 /**
  * Home：应用主页面。
  * - 设置：localStorage（轻量、读取快）
@@ -174,9 +183,20 @@ export default function Home() {
   const [docs, setDocs] = useState<DocItem[]>([]);
   const [activeDocId, setActiveDocId] = useState<string | null>(null);
   const docsRef = useRef<DocItem[]>([]);
+  const [leftSidebarOpen, setLeftSidebarOpen] = useState(true);
+  const [rightSidebarOpen, setRightSidebarOpen] = useState(true);
 
   const selectedDocs = docs.filter((d) => d.checked);
-  const selectedDocsContent = selectedDocs.map((d) => d.content).join('\n\n');
+  const selectedDocsContent = selectedDocs
+    .filter(
+      (d) => d.kind !== 'img' || (d.visionSummary ?? '').trim().length > 0,
+    )
+    .map((d) => {
+      if (d.kind !== 'img') return d.content;
+      const v = (d.visionSummary ?? '').trim();
+      return v ? `【图片视觉分析｜${d.name}】\n${v}` : '';
+    })
+    .join('\n\n');
   const selectedDocsCharCount = selectedDocsContent.length;
   const isContextTooLong = selectedDocsCharCount > 5000;
 
@@ -195,6 +215,8 @@ export default function Home() {
       setRagChunkSize(settings.ragChunkSize);
       setRagOverlap(settings.ragOverlap);
       setEmbeddingModel(settings.embeddingModel);
+      setLeftSidebarOpen(settings.leftSidebarOpen ?? true);
+      setRightSidebarOpen(settings.rightSidebarOpen ?? true);
 
       // 2) 兼容旧 localStorage 一次性迁移到 IndexedDB
       const legacy = loadLegacyBundleFromLocalStorage();
@@ -223,6 +245,7 @@ export default function Home() {
         setRagChunkSize(mergedSettings.ragChunkSize);
         setRagOverlap(mergedSettings.ragOverlap);
         setEmbeddingModel(mergedSettings.embeddingModel);
+        // visionModel 已移除，勾选图片时统一使用 VISION_MODEL
       }
 
       // 3) 加载会话（IndexedDB）
@@ -276,6 +299,8 @@ export default function Home() {
           ragChunkSize,
           ragOverlap,
           embeddingModel,
+          leftSidebarOpen,
+          rightSidebarOpen,
         }),
       );
     } catch {
@@ -291,6 +316,8 @@ export default function Home() {
     ragChunkSize,
     ragOverlap,
     embeddingModel,
+    leftSidebarOpen,
+    rightSidebarOpen,
     isHydrated,
   ]);
 
@@ -452,55 +479,125 @@ export default function Home() {
     setCurrentId(activeId);
     setIsLoading(true);
 
-    const trimmedSystem = systemPrompt.trim();
-
-    let contextPrefix = '';
-    if (ragEnabled && selectedDocs.length > 0) {
-      try {
-        // RAG 选择在前端本地做：
-        // - 文档/切片与 embedding 缓存都在 IndexedDB，避免每次都把大文档传回服务端
-        // - embedding 请求仍通过 /api/embed 走本机 Ollama，但命中缓存时不会重复计算
-        // - 引用信息（页码/标题）可直接用于右侧“论文式引用”跳转与高亮
-        const hits = await retrieveRagHits({
-          query: userMessage,
-          docs: selectedDocs,
-          topK: ragTopK,
-          chunkSize: ragChunkSize,
-          overlap: ragOverlap,
-          embeddingModel,
-        });
-        setRagError(null);
-        setRagHits(hits);
-        const lines = hits
-          .map(
-            (c, idx) =>
-              `【片段${idx + 1}｜${c.docName}${c.pageStart ? `｜p${c.pageStart}${c.pageEnd && c.pageEnd !== c.pageStart ? `-${c.pageEnd}` : ''}` : ''}${c.heading ? `｜${c.heading}` : ''}｜score=${c.score.toFixed(3)}】\n${c.chunk}`,
-          )
-          .join('\n\n');
-        if (lines) {
-          contextPrefix = `请仅根据以下检索到的资料回答问题（若资料不足请说明）：\n${lines}\n\n`;
-        }
-      } catch (e) {
-        setRagError(e instanceof Error ? e.message : 'RAG 请求异常');
-        setRagHits([]);
-        // RAG 失败则降级为全量注入（保持可用性）
-      }
-    }
-
-    if (!contextPrefix) {
-      contextPrefix = selectedDocsContent
-        ? `请根据以下资料回答问题：\n${selectedDocsContent}\n\n`
-        : '';
-    }
-
-    const effectiveSystem = (contextPrefix + trimmedSystem).trim();
-
-    const messagesToSend =
-      effectiveSystem === ''
-        ? newMessages
-        : [{ role: 'system', content: effectiveSystem }, ...newMessages];
+    // 仅携带「当前已上传且已勾选」的图片；已删除或未勾选的不带入对话
+    const selectedImageDocs = docs.filter(
+      (d) => d.checked && d.kind === 'img' && !!d.blob,
+    );
+    const hasImages = selectedImageDocs.length > 0;
 
     try {
+      // 勾选图片时：走 /api/chat（多模态），支持多轮追问 + 流式输出
+      // 发送前再校验一次（docsRef 为最新），避免用户已取消勾选/删除时仍带图
+      if (hasImages) {
+        const currentImageDocs = docsRef.current.filter(
+          (d) => d.checked && d.kind === 'img' && !!d.blob,
+        );
+        if (currentImageDocs.length > 0) {
+          const imageBases = await Promise.all(
+            currentImageDocs.slice(0, 2).map((d) => blobToBase64(d.blob!)),
+          );
+          const systemContent =
+            (systemPrompt.trim() || '请用中文回答，结合用户上传并勾选的图片进行分析作答。').trim();
+          const messagesWithImages: any[] = newMessages.map((m, i) => {
+            const isLastUser =
+              i === newMessages.length - 1 && m.role === 'user';
+            if (isLastUser) {
+              return {
+                role: 'user' as const,
+                content: `请用中文描述，${m.content}`,
+                images: imageBases,
+              };
+            }
+            return m;
+          });
+          const messagesToSend =
+            systemContent === ''
+              ? messagesWithImages
+              : [{ role: 'system' as const, content: systemContent }, ...messagesWithImages];
+
+          const res = await fetch('/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              messages: messagesToSend,
+              model: VISION_MODEL,
+              options: { num_ctx: numCtx },
+            }),
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({ error: res.statusText }));
+            throw new Error(err.error || `图片分析失败: ${res.status}`);
+          }
+
+          const reader = res.body?.getReader();
+          const decoder = new TextDecoder();
+          let assistantContent = '';
+          if (reader) {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              assistantContent += decoder.decode(value, { stream: true });
+              const updated: Message[] = [
+                ...newMessages,
+                { role: 'assistant', content: assistantContent },
+              ];
+              updateConversation(activeId, () => ({ ...conv, messages: updated }));
+            }
+          }
+          const finalMessages: Message[] = assistantContent
+            ? [...newMessages, { role: 'assistant', content: assistantContent }]
+            : [...newMessages, { role: 'assistant', content: '(无回复内容)' }];
+          updateConversation(activeId, () => ({
+            ...conv,
+            messages: finalMessages,
+          }));
+          if (finalMessages.length >= 2 && !conv.titleGenerated) {
+            fetchTitle(activeId, finalMessages);
+          }
+          return;
+        }
+      }
+
+      // 无图片勾选（或校验时已取消）：走 chat 流程（RAG + system prompt）
+      const trimmedSystem = systemPrompt.trim();
+      let contextPrefix = '';
+      if (ragEnabled && selectedDocs.length > 0) {
+        try {
+          const hits = await retrieveRagHits({
+            query: userMessage,
+            docs: selectedDocs,
+            topK: ragTopK,
+            chunkSize: ragChunkSize,
+            overlap: ragOverlap,
+            embeddingModel,
+          });
+          setRagError(null);
+          setRagHits(hits);
+          const lines = hits
+            .map(
+              (c, idx) =>
+                `【片段${idx + 1}｜${c.docName}${c.pageStart ? `｜p${c.pageStart}${c.pageEnd && c.pageEnd !== c.pageStart ? `-${c.pageEnd}` : ''}` : ''}${c.heading ? `｜${c.heading}` : ''}｜score=${c.score.toFixed(3)}】\n${c.chunk}`,
+            )
+            .join('\n\n');
+          if (lines) {
+            contextPrefix = `请仅根据以下检索到的资料回答问题（若资料不足请说明）：\n${lines}\n\n`;
+          }
+        } catch (e) {
+          setRagError(e instanceof Error ? e.message : 'RAG 请求异常');
+          setRagHits([]);
+        }
+      }
+      if (!contextPrefix) {
+        contextPrefix = selectedDocsContent
+          ? `请根据以下资料回答问题：\n${selectedDocsContent}\n\n`
+          : '';
+      }
+      const effectiveSystem = (contextPrefix + trimmedSystem).trim();
+      const messagesToSend =
+        effectiveSystem === ''
+          ? newMessages
+          : [{ role: 'system', content: effectiveSystem }, ...newMessages];
+
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -510,7 +607,6 @@ export default function Home() {
           options: { num_ctx: numCtx },
         }),
       });
-
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: res.statusText }));
         throw new Error(err.error || `请求失败: ${res.status}`);
@@ -519,7 +615,6 @@ export default function Home() {
       const reader = res.body?.getReader();
       const decoder = new TextDecoder();
       let assistantContent = '';
-
       if (reader) {
         while (true) {
           const { done, value } = await reader.read();
@@ -532,7 +627,6 @@ export default function Home() {
           updateConversation(activeId, () => ({ ...conv, messages: updated }));
         }
       }
-
       const finalMessages: Message[] = assistantContent
         ? [...newMessages, { role: 'assistant', content: assistantContent }]
         : [...newMessages, { role: 'assistant', content: '(无回复内容)' }];
@@ -540,7 +634,6 @@ export default function Home() {
         ...conv,
         messages: finalMessages,
       }));
-
       if (finalMessages.length >= 2 && !conv.titleGenerated) {
         fetchTitle(activeId, finalMessages);
       }
@@ -580,7 +673,13 @@ export default function Home() {
     let pages: DocItem['pages'];
     let blob: Blob | undefined;
 
-    if (/\.pdf$/i.test(file.name)) {
+    // 图片：先做“上传 + 预览 + 持久化”，后续再叠加 OCR -> content -> RAG
+    if (/\.(png|jpe?g|webp|gif)$/i.test(file.name)) {
+      kind = 'img';
+      blob = file;
+      objectUrl = URL.createObjectURL(file);
+      content = '';
+    } else if (/\.pdf$/i.test(file.name)) {
       kind = 'pdf';
       // PDF 需要持久化 blob：
       // - 右侧预览依赖 objectUrl，但 objectUrl 不能跨刷新保存
@@ -625,6 +724,8 @@ export default function Home() {
       blob,
       pages,
       checked: true,
+      visionSummary: '',
+      visionStatus: 'none',
     };
 
     setDocs((prev) => [doc, ...prev]);
@@ -637,10 +738,26 @@ export default function Home() {
       pages,
       checked: true,
       blob,
+      visionSummary: '',
+      visionStatus: 'none',
       createdAt: Date.now(),
       updatedAt: Date.now(),
     }).catch(() => null);
   };
+
+  /** Blob -> base64（用于把图片附在 /api/chat 的 user 消息上）。 */
+  const blobToBase64 = async (b: Blob): Promise<string> => {
+    const ab = await b.arrayBuffer();
+    let binary = '';
+    const bytes = new Uint8Array(ab);
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  };
+
+  // 图片分析仅依赖视觉模型（VLM）。
 
   /**
    * 上传文件 change handler：
@@ -699,6 +816,8 @@ export default function Home() {
     void removeDocFromDb(id).catch(() => null);
   };
 
+  // 图片上传后无需自动分析，分析在用户发问时通过 /api/chat（多模态）实时完成。
+
   if (!isHydrated) {
     return (
       <main className="flex h-screen items-center justify-center bg-zinc-50 dark:bg-zinc-950">
@@ -715,6 +834,8 @@ export default function Home() {
         onSelect={setCurrentId}
         onCreate={createConversation}
         onDelete={deleteConversation}
+        collapsed={!leftSidebarOpen}
+        onToggle={() => setLeftSidebarOpen((v) => !v)}
       />
       <div className="flex min-h-0 flex-1 flex-col min-w-0 overflow-hidden">
         {/* 顶部栏 */}
@@ -724,8 +845,10 @@ export default function Home() {
               {currentConversation?.title ?? 'My Local AI'}
             </h1>
             <div className="flex items-center gap-2">
-              <ModelSelect value={model} onChange={setModel} options={MODELS} />
               <SettingsDialog
+                model={model}
+                setModel={setModel}
+                chatModels={MODELS}
                 systemPrompt={systemPrompt}
                 setSystemPrompt={setSystemPrompt}
                 ragEnabled={ragEnabled}
@@ -760,6 +883,8 @@ export default function Home() {
           isContextTooLong={isContextTooLong}
           ragEnabled={ragEnabled}
           ragHits={ragHits}
+          rightSidebarOpen={rightSidebarOpen}
+          onToggleRightSidebar={() => setRightSidebarOpen((v) => !v)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault();

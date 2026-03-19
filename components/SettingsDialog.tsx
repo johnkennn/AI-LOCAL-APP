@@ -4,12 +4,20 @@ import React from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import { ModelSelect } from '@/components/ModelSelect';
 
+interface ModelOption {
+  id: string;
+  name: string;
+}
+
 const EMBEDDING_MODELS = [
   { id: 'mxbai-embed-large', name: 'mxbai-embed-large' },
   { id: 'nomic-embed-text', name: 'nomic-embed-text' },
 ];
 
 interface SettingsDialogProps {
+  model: string;
+  setModel: (v: string) => void;
+  chatModels: ModelOption[];
   systemPrompt: string;
   setSystemPrompt: (v: string) => void;
   ragEnabled: boolean;
@@ -33,6 +41,9 @@ interface SettingsDialogProps {
  */
 export function SettingsDialog(props: SettingsDialogProps) {
   const {
+    model,
+    setModel,
+    chatModels,
     systemPrompt,
     setSystemPrompt,
     ragEnabled,
@@ -84,6 +95,22 @@ export function SettingsDialog(props: SettingsDialogProps) {
           </div>
 
           <div className="max-h-[70vh] overflow-auto px-5 py-4 space-y-4">
+            <div className="rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/60 px-3 py-2">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium text-zinc-700 dark:text-zinc-200">
+                    聊天模型
+                  </div>
+                  <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                    用于对话回复（发送到 <span className="font-mono">/api/chat</span>）。勾选图片提问时，将使用视觉模型（如 llava）作答，与聊天模型不同。
+                  </div>
+                </div>
+                <div className="w-56">
+                  <ModelSelect value={model} onChange={setModel} options={chatModels} />
+                </div>
+              </div>
+            </div>
+
             <div>
               <div className="mb-2 text-xs font-medium text-zinc-600 dark:text-zinc-400">
                 系统提示词
@@ -95,6 +122,9 @@ export function SettingsDialog(props: SettingsDialogProps) {
                 placeholder="如：你是一个精通 JavaScript 的架构师"
                 className="w-full rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/80 px-3 py-2 text-sm placeholder:text-zinc-400 dark:placeholder:text-zinc-500 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
               />
+              <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                影响 AI 的角色/语气/约束；会作为第一条 <span className="font-mono">system</span> 消息注入到对话中。
+              </div>
             </div>
 
             <div className="rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/60 p-3 space-y-3">
@@ -118,6 +148,9 @@ export function SettingsDialog(props: SettingsDialogProps) {
                     />
                   </div>
                 </div>
+              </div>
+              <div className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                RAG 会从已勾选文档中检索与问题最相关的片段（TopK），再把片段作为“引用资料”注入，降低长文档全量注入带来的噪声与超长风险。
               </div>
 
               <div className="flex flex-wrap items-center gap-3">
@@ -163,6 +196,20 @@ export function SettingsDialog(props: SettingsDialogProps) {
                   />
                 </div>
               </div>
+              <div className="grid grid-cols-1 gap-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                <div>
+                  <span className="font-medium">TopK</span>：返回/注入的命中片段数量。越大引用越多但更容易冗余、也更长。
+                </div>
+                <div>
+                  <span className="font-medium">Chunk</span>：切片目标长度（字符级，不是 token）。越大上下文更完整但检索更粗。
+                </div>
+                <div>
+                  <span className="font-medium">Overlap</span>：相邻切片的重叠长度。用于避免关键句被切断；过大则重复增多。
+                </div>
+                <div>
+                  <span className="font-medium">Embedding</span>：将文本转为向量用于相似度检索；不同 embedding 模型效果/速度/维度可能不同。
+                </div>
+              </div>
 
               {ragError && (
                 <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-800 dark:bg-red-900/20 dark:text-red-200">
@@ -179,6 +226,9 @@ export function SettingsDialog(props: SettingsDialogProps) {
                 <div className="text-xs text-zinc-400">
                   越大越能“记住”长文档，但更耗内存/更慢
                 </div>
+                <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                  控制模型一次能处理的上下文上限（近似窗口大小）；过小易“忘记”，过大可能变慢/占用更多内存。
+                </div>
               </div>
               <input
                 type="number"
@@ -189,6 +239,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
                 className="w-28 rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-2 py-1 text-sm text-zinc-900 dark:text-zinc-100 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
               />
             </div>
+
           </div>
 
           <div className="flex justify-end gap-2 border-t border-zinc-200 dark:border-zinc-800 px-5 py-4">

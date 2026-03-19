@@ -17,6 +17,61 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'messages 不能为空' }, { status: 400 });
     }
 
+    const hasImages = Array.isArray(messages)
+      ? messages.some((m: any) => Array.isArray(m?.images) && m.images.length > 0)
+      : false;
+
+    // 优先尝试流式输出（包括多模态），提升交互体验。
+    // 若流式多模态不被支持，兜底为非流式。
+    let useStream = true;
+    if (hasImages) {
+      try {
+        const streamResponse = await ollama.chat({
+          model,
+          stream: true,
+          messages,
+          ...(options ? { options } : {}),
+        });
+        const stream = new ReadableStream({
+          async start(controller) {
+            try {
+              for await (const part of streamResponse) {
+                const content = part.message?.content ?? '';
+                if (content) controller.enqueue(content);
+              }
+            } catch (err) {
+              controller.enqueue(
+                JSON.stringify({ error: err instanceof Error ? err.message : 'Ollama 请求失败' })
+              );
+            } finally {
+              controller.close();
+            }
+          },
+        });
+        return new NextResponse(stream, {
+          headers: {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Transfer-Encoding': 'chunked',
+          },
+        });
+      } catch (_streamErr) {
+        useStream = false;
+      }
+    }
+
+    if (hasImages && !useStream) {
+      const response = await ollama.chat({
+        model,
+        stream: false,
+        messages,
+        ...(options ? { options } : {}),
+      });
+      const text = (response.message?.content ?? '').trim();
+      return new NextResponse(text || '(无回复内容)', {
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+      });
+    }
+
     const response = await ollama.chat({
       model,
       messages,

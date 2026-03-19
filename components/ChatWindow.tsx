@@ -33,6 +33,9 @@ interface ChatWindowProps {
     heading?: string;
   }>;
   onKeyDown: (e: React.KeyboardEvent<HTMLInputElement>) => void;
+  /** 右侧文档栏是否展开（false 时显示窄条+展开按钮） */
+  rightSidebarOpen: boolean;
+  onToggleRightSidebar: () => void;
 }
 
 /**
@@ -55,6 +58,8 @@ export function ChatWindow({
   ragEnabled,
   ragHits,
   onKeyDown,
+  rightSidebarOpen,
+  onToggleRightSidebar,
 }: ChatWindowProps) {
   const activeDoc = docs.find((d) => d.id === activeDocId) ?? null;
   const [pdfPage, setPdfPage] = React.useState<number | null>(null);
@@ -65,6 +70,11 @@ export function ChatWindow({
   /** 当前选中的命中片段（用于右侧预览高亮/跳转提示）。 */
   const activeHit =
     activeHitIdx != null && ragHits[activeHitIdx] ? ragHits[activeHitIdx] : null;
+
+  // 若命中引用全部来自图片，则不展示“命中引用”面板，避免干扰
+  const showRagHitsPanel =
+    ragHits.length > 0 &&
+    ragHits.some((h) => (docs.find((d) => d.id === h.docId)?.kind ?? 'txt') !== 'img');
 
   React.useEffect(() => {
     // 切换文档时重置跳转页，避免 iframe 无感刷新
@@ -192,24 +202,41 @@ export function ChatWindow({
         </div>
       </div>
 
-      {/* 右侧：文档列表与预览 */}
-      <aside className="hidden lg:flex w-96 shrink-0 flex-col border-l border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900">
-        <div className="shrink-0 border-b border-zinc-200 dark:border-zinc-800 px-4 py-3">
-          <div className="flex items-center justify-between">
-            <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-              已上传文档
-            </div>
-            <label className="cursor-pointer rounded-md px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800">
-              + 添加
-              <input
-                type="file"
-                accept=".txt,.md,.pdf"
-                className="hidden"
-                onChange={onFileChange}
-              />
-            </label>
-          </div>
-          {isContextTooLong && !ragEnabled && (
+      {/* 右侧：文档列表与预览（支持收起/展开） */}
+      <aside
+        className={`hidden lg:flex shrink-0 flex-col border-l border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 transition-[width] duration-200 ease-out overflow-hidden ${
+          rightSidebarOpen ? 'w-96' : 'w-10'
+        }`}
+      >
+        {rightSidebarOpen ? (
+          <>
+            <div className="shrink-0 border-b border-zinc-200 dark:border-zinc-800 px-4 py-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 shrink-0 min-w-0">
+                  <button
+                    type="button"
+                    onClick={onToggleRightSidebar}
+                    className="rounded-md p-1.5 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-700 dark:hover:text-zinc-200 transition-colors"
+                    title="收起文档栏"
+                    aria-label="收起文档栏"
+                  >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M15 18l6-6-6-6" />
+                    </svg>
+                  </button>
+                  <span className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 truncate">已上传文档</span>
+                </div>
+                <label className="cursor-pointer rounded-md px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800 shrink-0">
+                  + 添加
+                  <input
+                    type="file"
+                    accept=".txt,.md,.pdf,.png,.jpg,.jpeg,.webp,.gif"
+                    className="hidden"
+                    onChange={onFileChange}
+                  />
+                </label>
+              </div>
+              {isContextTooLong && !ragEnabled && (
             // 仅在未开启 RAG 时提示“内容过长”，开启 RAG 后会走 TopK 注入无需该提示
             <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-700 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-200">
               内容过长（已选文档超 5000 字），建议在设置中开启 RAG 模式
@@ -252,7 +279,8 @@ export function ChatWindow({
                         {d.name}
                       </div>
                       <div className="text-[11px] text-zinc-400">
-                        {d.kind.toUpperCase()} · {d.content.length} 字
+                        {d.kind.toUpperCase()} ·{' '}
+                        {d.kind === 'img' ? '图片' : `${d.content.length} 字`}
                       </div>
                     </div>
                     <button
@@ -295,7 +323,7 @@ export function ChatWindow({
             )}
           </div>
           <div className="h-[calc(100%-2.25rem)] px-2 pb-2 flex flex-col gap-2">
-            {ragHits.length > 0 && (
+            {showRagHitsPanel && (
               <div className="rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/40 p-2">
                 <div className="mb-1 text-[11px] font-medium text-zinc-500 dark:text-zinc-400">
                   命中引用（点击高亮 / 跳转）
@@ -350,6 +378,14 @@ export function ChatWindow({
                 src={`${activeDoc.objectUrl}${pdfPage ? `#page=${pdfPage}` : ''}`}
                 className="h-full w-full rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white"
               />
+            ) : activeDoc.kind === 'img' && activeDoc.objectUrl ? (
+              <div className="h-full overflow-auto rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-2">
+                <img
+                  src={activeDoc.objectUrl}
+                  alt={activeDoc.name}
+                  className="max-h-full w-full object-contain rounded"
+                />
+              </div>
             ) : (
               <div className="h-full overflow-auto rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-3">
                 <pre
@@ -371,6 +407,22 @@ export function ChatWindow({
             )}
           </div>
         </div>
+          </>
+        ) : (
+          <div className="flex min-w-0 flex-1 flex-col items-center justify-center border-l border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900">
+            <button
+              type="button"
+              onClick={onToggleRightSidebar}
+              className="rounded p-2 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-700 dark:hover:text-zinc-200 transition-colors"
+              title="展开文档栏"
+              aria-label="展开文档栏"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M9 18l-6-6 6-6" />
+              </svg>
+            </button>
+          </div>
+        )}
       </aside>
     </div>
   );

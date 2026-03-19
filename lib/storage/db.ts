@@ -17,7 +17,7 @@ export type StoredDoc = Omit<DocItem, 'objectUrl'> & {
   createdAt: number;
   updatedAt: number;
   /**
-   * 仅用于 pdf 预览持久化。txt/md 不需要。
+   * 用于二进制预览持久化（pdf/img）。txt/md 不需要。
    * objectUrl 会在读取时基于 blob 重新创建。
    */
   blob?: Blob;

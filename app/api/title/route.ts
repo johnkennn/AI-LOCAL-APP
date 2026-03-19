@@ -2,6 +2,13 @@
 import ollama from 'ollama';
 import { NextResponse } from 'next/server';
 
+/**
+ * Title API：根据对话前两句生成短标题（用于侧边栏展示）。
+ *
+ * 策略：
+ * - 只取第一条 user 与第一条 assistant 的少量片段作为 preview，避免传入过长上下文
+ * - 系统提示词强约束“只输出标题、不解释”，并对输出做清洗与截断兜底
+ */
 export async function POST(req: Request) {
   try {
     const { messages, model = 'deepseek-r1' } = await req.json();

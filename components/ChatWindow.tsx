@@ -35,6 +35,10 @@ interface ChatWindowProps {
   onKeyDown: (e: React.KeyboardEvent<HTMLInputElement>) => void;
 }
 
+/**
+ * ChatWindow：主聊天窗口（左：消息 + 输入；右：文档列表 + 预览 + 引用）。
+ * 这里承载 UI 交互（滚动贴底、引用点击跳页/高亮），具体数据读写由 page.tsx 负责。
+ */
 export function ChatWindow({
   messages,
   isLoading,
@@ -55,7 +59,10 @@ export function ChatWindow({
   const activeDoc = docs.find((d) => d.id === activeDocId) ?? null;
   const [pdfPage, setPdfPage] = React.useState<number | null>(null);
   const [activeHitIdx, setActiveHitIdx] = React.useState<number | null>(null);
+  const scrollRef = React.useRef<HTMLDivElement | null>(null);
+  const stickToBottomRef = React.useRef(true);
 
+  /** 当前选中的命中片段（用于右侧预览高亮/跳转提示）。 */
   const activeHit =
     activeHitIdx != null && ragHits[activeHitIdx] ? ragHits[activeHitIdx] : null;
 
@@ -65,6 +72,15 @@ export function ChatWindow({
     setActiveHitIdx(null);
   }, [activeDocId]);
 
+  React.useEffect(() => {
+    // 默认停在底部：进入会话/新增消息/加载态变化时
+    const el = scrollRef.current;
+    if (!el) return;
+    if (!stickToBottomRef.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [messages.length, isLoading]);
+
+  /** HTML 转义：用于将纯文本安全塞进 dangerouslySetInnerHTML（仅用于高亮）。 */
   const escapeHtml = (s: string) =>
     s
       .replace(/&/g, '&amp;')
@@ -73,6 +89,10 @@ export function ChatWindow({
       .replace(/\"/g, '&quot;')
       .replace(/'/g, '&#039;');
 
+  /**
+   * 仅高亮一次命中片段，避免全文多次 mark 导致可读性下降。
+   * 对于找不到完全匹配的情况，回退为不高亮（仍可用引用/跳页定位）。
+   */
   const highlightOnce = (text: string, snippet: string) => {
     const s = snippet.trim().slice(0, 120);
     if (!s) return escapeHtml(text);
@@ -87,7 +107,18 @@ export function ChatWindow({
     <div className="flex min-h-0 flex-1 min-w-0 overflow-hidden">
       {/* 左侧：聊天 */}
       <div className="flex min-h-0 flex-1 flex-col min-w-0 overflow-hidden">
-        <div className="min-h-0 flex-1 overflow-y-auto">
+        <div
+          ref={scrollRef}
+          className="min-h-0 flex-1 overflow-y-auto"
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            const threshold = 24;
+            // 仅当用户“接近底部”时才继续自动贴底；避免阅读历史时被强制拉回底部
+            const atBottom =
+              el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+            stickToBottomRef.current = atBottom;
+          }}
+        >
           <div className="mx-auto max-w-3xl px-4 py-6">
             <div className="flex flex-col gap-4">
               {messages.map((m, i) => (
@@ -179,6 +210,7 @@ export function ChatWindow({
             </label>
           </div>
           {isContextTooLong && !ragEnabled && (
+            // 仅在未开启 RAG 时提示“内容过长”，开启 RAG 后会走 TopK 注入无需该提示
             <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-700 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-200">
               内容过长（已选文档超 5000 字），建议在设置中开启 RAG 模式
             </div>
@@ -200,11 +232,13 @@ export function ChatWindow({
                         ? 'bg-zinc-100 dark:bg-zinc-800'
                         : 'hover:bg-zinc-50 dark:hover:bg-zinc-800/50'
                     }`}
+                    // 点击条目切换右侧预览文档；勾选/删除按钮会 stopPropagation 避免误触切换
                     onClick={() => onSetActiveDoc(d.id)}
                   >
                     <input
                       type="checkbox"
                       checked={d.checked}
+                      // checked 控制该文档是否参与上下文注入（由 page.tsx 持久化到 IndexedDB）
                       onChange={() => onToggleDoc(d.id)}
                       onClick={(e) => e.stopPropagation()}
                       className="h-4 w-4"
@@ -225,6 +259,7 @@ export function ChatWindow({
                       type="button"
                       onClick={(e) => {
                         e.stopPropagation();
+                        // 删除文档：实际删除与持久化由 page.tsx 处理
                         onRemoveDoc(d.id);
                       }}
                       className="opacity-0 group-hover:opacity-100 rounded p-1 text-zinc-400 hover:text-red-500 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-opacity"
@@ -271,6 +306,7 @@ export function ChatWindow({
                       key={`${h.docId}-${idx}`}
                       type="button"
                       onClick={() => {
+                        // “论文式引用”交互：点击命中片段 -> 切换到对应文档，并对 PDF 跳到命中页
                         setActiveHitIdx(idx);
                         onSetActiveDoc(h.docId);
                         if (h.pageStart) setPdfPage(h.pageStart);
@@ -307,8 +343,10 @@ export function ChatWindow({
               </div>
             ) : activeDoc.kind === 'pdf' && activeDoc.objectUrl ? (
               <iframe
+                // key 强制 remount：部分浏览器的 PDF viewer 对 #page 变化不敏感，remount 可确保跳页生效
                 key={`${activeDoc.objectUrl}-${pdfPage ?? 'top'}`}
                 title={activeDoc.name}
+                // 通过 URL fragment #page=N 触发 PDF viewer 跳转（无需额外库）
                 src={`${activeDoc.objectUrl}${pdfPage ? `#page=${pdfPage}` : ''}`}
                 className="h-full w-full rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white"
               />
@@ -317,6 +355,9 @@ export function ChatWindow({
                 <pre
                   className="whitespace-pre-wrap break-words text-xs text-zinc-700 dark:text-zinc-200"
                   dangerouslySetInnerHTML={{
+                    // 文本/Markdown 预览区：
+                    // - 默认展示转义后的纯文本（避免 XSS）
+                    // - 若当前 activeHit 属于该文档，则对命中片段做一次 mark 高亮（便于定位）
                     __html:
                       activeHit && activeHit.docId === activeDoc.id
                         ? highlightOnce(

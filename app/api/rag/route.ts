@@ -1,6 +1,18 @@
 import { NextResponse } from 'next/server';
 import crypto from 'node:crypto';
 
+/**
+ * RAG API（legacy/保留实现）：
+ * 该路由最初用于“服务端切片 + embedding + 向量检索”。
+ *
+ * 当前版本的主路径已改为：
+ * - 前端本地切片/检索（见 `lib/rag/client.ts`）
+ * - embedding 统一走 `/api/embed`，并用 IndexedDB 做跨刷新缓存
+ *
+ * 仍保留此路由的原因：
+ * - 便于回退/对比/参考（切片策略与安全截断逻辑仍有价值）
+ * - 未来若要把检索迁回服务端，可在此基础上继续演进
+ */
 type Doc = {
   id: string;
   name: string;
@@ -14,11 +26,13 @@ type Doc = {
 const MAX_EMBED_CHARS = 1500;
 const MAX_CHUNK_SIZE = 1000;
 
+/** 将输入限制在整数范围内（防止参数异常导致性能/内存问题）。 */
 function clampInt(n: number, min: number, max: number) {
   const v = Number.isFinite(n) ? Math.floor(n) : min;
   return Math.max(min, Math.min(max, v));
 }
 
+/** embedding 安全截断（字符级，非 token）。 */
 function safeForEmbedding(text: string): string {
   const clean = text.replace(/\r\n/g, '\n').trim();
   if (clean.length <= MAX_EMBED_CHARS) return clean;
@@ -38,6 +52,7 @@ type Chunk = {
   pageEnd?: number;
 };
 
+/** 文本分段：优先按空行，其次按常见标点粗切（legacy 参考实现）。 */
 function splitParagraphs(text: string): string[] {
   const clean = text.replace(/\r\n/g, '\n');
   // 优先按空行分段；如果没有空行，再按句号/分号等粗切
@@ -52,6 +67,7 @@ function splitParagraphs(text: string): string[] {
     .filter(Boolean);
 }
 
+/** Markdown 切片：识别标题并将正文按段落拆分为 blocks（legacy 参考实现）。 */
 function blocksFromMd(text: string): Block[] {
   const lines = text.replace(/\r\n/g, '\n').split('\n');
   const blocks: Block[] = [];
@@ -81,10 +97,12 @@ function blocksFromMd(text: string): Block[] {
   return blocks;
 }
 
+/** 纯文本切片：按段落拆分（legacy 参考实现）。 */
 function blocksFromTxt(text: string): Block[] {
   return splitParagraphs(text).map((p) => ({ text: p }));
 }
 
+/** PDF 切片：按页保留 page number，并按段落拆分（legacy 参考实现）。 */
 function blocksFromPdfPages(pages: Array<{ page: number; text: string }>): Block[] {
   const blocks: Block[] = [];
   for (const p of pages) {
@@ -95,6 +113,10 @@ function blocksFromPdfPages(pages: Array<{ page: number; text: string }>): Block
   return blocks;
 }
 
+/**
+ * 将 blocks 聚合为 chunks（legacy 参考实现）。
+ * overlapChars 用于“字符预算回退”，让相邻 chunk 有重叠上下文。
+ */
 function buildChunks(blocks: Block[], chunkSize: number, overlapChars: number): Chunk[] {
   if (blocks.length === 0) return [];
   const chunks: Chunk[] = [];
@@ -145,6 +167,7 @@ function buildChunks(blocks: Block[], chunkSize: number, overlapChars: number): 
   return chunks;
 }
 
+/** 余弦相似度：query 向量与 chunk 向量的相关性打分（legacy 参考实现）。 */
 function cosineSimilarity(a: number[], b: number[]): number {
   let dot = 0;
   let na = 0;
@@ -160,6 +183,11 @@ function cosineSimilarity(a: number[], b: number[]): number {
 
 const embeddingCache = new Map<string, number[]>();
 
+/**
+ * embeddings 获取（legacy 服务端实现）：
+ * - 进程内 Map 缓存：同一次服务端生命周期内避免重复算
+ * - 逐步截断重试：降低 “input length exceeds context length” 的失败率
+ */
 async function embed(prompt: string, model: string): Promise<number[]> {
   const base = safeForEmbedding(prompt);
   const attempts = [base, base.slice(0, 800), base.slice(0, 400), base.slice(0, 200)].filter(
@@ -198,6 +226,10 @@ async function embed(prompt: string, model: string): Promise<number[]> {
   throw new Error(lastErr ?? 'embeddings 请求失败');
 }
 
+/**
+ * POST /api/rag（legacy）：输入 query + docs，返回 topK chunks。
+ * 当前主链路已迁到前端本地检索，此处保留用于参考/回退。
+ */
 export async function POST(req: Request) {
   try {
     const {

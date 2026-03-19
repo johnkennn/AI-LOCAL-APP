@@ -27,6 +27,10 @@ interface SettingsDialogProps {
   setNumCtx: (v: number) => void;
 }
 
+/**
+ * SettingsDialog：集中管理“系统提示词 + RAG 参数 + num_ctx”等设置项。
+ * 这些设置属于轻量状态，持久化由 `app/page.tsx` 负责（localStorage settings 层）。
+ */
 export function SettingsDialog(props: SettingsDialogProps) {
   const {
     systemPrompt,
@@ -60,6 +64,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm" />
         <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-[min(720px,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-xl">
+          {/* Radix a11y：DialogContent 需要 Description；此处用 sr-only 供读屏使用 */}
           <Dialog.Description className="sr-only">
             设置系统提示词、RAG 检索参数与上下文窗口
           </Dialog.Description>

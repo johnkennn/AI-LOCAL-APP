@@ -2,6 +2,7 @@
   "name": "ai-local-app",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "yarn@1.22.22",
   "scripts": {
     "dev": "next dev -p 3001",
     "build": "next build",
@@ -12,6 +13,7 @@
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-select": "^2.2.6",
     "all": "^0.0.0",
+    "dexie": "^4.3.0",
     "highlight.js": "^11.11.1",
     "katex": "^0.16.33",
     "next": "16.1.6",

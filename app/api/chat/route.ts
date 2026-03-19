@@ -2,6 +2,14 @@
 import ollama from 'ollama';
 import { NextResponse } from 'next/server';
 
+/**
+ * Chat API：将前端 messages 转发给本机 Ollama，并以“纯文本流”形式返回。
+ *
+ * 设计要点：
+ * - stream: true：便于前端流式拼接渲染，提升交互体验
+ * - Content-Type: text/plain：前端直接把 chunk append 到 assistantContent
+ * - options 可透传（如 num_ctx），用于控制上下文窗口大小
+ */
 export async function POST(req: Request) {
   try {
     const { messages, model = 'deepseek-r1', options } = await req.json();
@@ -24,6 +32,7 @@ export async function POST(req: Request) {
             if (content) controller.enqueue(content);
           }
         } catch (err) {
+          // 流式过程中出错：这里尽量返回可读错误字符串，前端会把它作为 assistant 内容展示
           controller.enqueue(
             JSON.stringify({ error: err instanceof Error ? err.message : 'Ollama 请求失败' })
           );

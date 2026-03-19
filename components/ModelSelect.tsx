@@ -13,7 +13,14 @@ interface ModelSelectProps {
   options: ModelOption[];
 }
 
+/**
+ * ModelSelect：模型下拉选择器（Radix Select）。
+ * 用于两处：
+ * - 顶部栏：选择聊天模型（传给 /api/chat）
+ * - 设置弹窗：选择 embedding 模型（传给 /api/embed）
+ */
 export function ModelSelect({ value, onChange, options }: ModelSelectProps) {
+  /** 当前选中项展示名称（找不到则回退为 id）。 */
   const selectedName = options.find((o) => o.id === value)?.name ?? value;
 
   return (
@@ -46,6 +53,7 @@ export function ModelSelect({ value, onChange, options }: ModelSelectProps) {
           sideOffset={4}
         >
           <Select.Viewport className="p-1">
+            {/* 下拉选项列表：value 为模型 id（传后端），展示为 name */}
             {options.map((opt) => (
               <Select.Item
                 key={opt.id}

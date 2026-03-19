@@ -10,6 +10,10 @@ interface SidebarProps {
   onDelete: (id: string, e: React.MouseEvent) => void;
 }
 
+/**
+ * Sidebar：会话侧边栏（创建/切换/删除）。
+ * 注意：删除按钮的 click 会 stopPropagation，避免触发“选中会话”。
+ */
 export function Sidebar({
   conversations,
   currentId,
@@ -19,6 +23,7 @@ export function Sidebar({
 }: SidebarProps) {
   return (
     <aside className="flex w-64 shrink-0 flex-col border-r border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900">
+      {/* 新建会话：仅触发 UI 事件，真正持久化在 page.tsx 的回调中完成 */}
       <button
         type="button"
         onClick={onCreate}
@@ -39,6 +44,7 @@ export function Sidebar({
                 <div
                   role="button"
                   tabIndex={0}
+                  // 支持键盘可达性：Enter/空格选中会话
                   onClick={() => onSelect(conv.id)}
                   onKeyDown={(e) =>
                     (e.key === 'Enter' || e.key === ' ') && onSelect(conv.id)
@@ -55,6 +61,7 @@ export function Sidebar({
                   <button
                     type="button"
                     onClick={(e) => onDelete(conv.id, e)}
+                    // 视觉上默认隐藏（hover 才出现），避免侧边栏噪音过大
                     className="shrink-0 rounded p-1 opacity-0 group-hover:opacity-100 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-zinc-400 hover:text-red-500 transition-opacity"
                     aria-label="删除对话"
                     title="删除"

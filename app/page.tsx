@@ -1,13 +1,51 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { ModelSelect } from '@/components/ModelSelect';
 import { Sidebar } from '@/components/Sidebar';
 import { ChatWindow } from '@/components/ChatWindow';
 import { SettingsDialog } from '@/components/SettingsDialog';
 import type { Conversation, Message, DocItem } from '@/lib/types';
+import {
+  getAllConversations,
+  removeConversation as removeConversationFromDb,
+  replaceAllConversations,
+  upsertConversation,
+} from '@/lib/storage/conversations';
+import {
+  getAllDocs,
+  removeDoc as removeDocFromDb,
+  toDocItem,
+  upsertDoc,
+} from '@/lib/storage/docs';
+import { retrieveRagHits } from '@/lib/rag/client';
 
-const STORAGE_KEY = 'ai-local-app-chat';
+const LEGACY_STORAGE_KEY = 'ai-local-app-chat';
+const SETTINGS_KEY = 'ai-local-app:settings:v1';
+
+type SettingsState = {
+  currentId: string | null;
+  model: string;
+  systemPrompt: string;
+  numCtx: number;
+  ragEnabled: boolean;
+  ragTopK: number;
+  ragChunkSize: number;
+  ragOverlap: number;
+  embeddingModel: string;
+};
+
+const DEFAULT_SETTINGS: SettingsState = {
+  currentId: null,
+  model: 'deepseek-r1',
+  systemPrompt: '',
+  numCtx: 8192,
+  ragEnabled: false,
+  ragTopK: 4,
+  ragChunkSize: 900,
+  ragOverlap: 150,
+  embeddingModel: 'mxbai-embed-large',
+};
 
 const MODELS = [
   { id: 'deepseek-r1', name: 'DeepSeek R1' },
@@ -18,6 +56,10 @@ const MODELS = [
   { id: 'llama3.1', name: 'Llama 3.1' },
 ];
 
+/**
+ * 生成稳定的客户端 id（会话/文档等）。
+ * 优先使用 crypto.randomUUID；在不支持的环境降级为时间戳+随机串。
+ */
 function generateId() {
   return (
     crypto.randomUUID?.() ??
@@ -25,39 +67,38 @@ function generateId() {
   );
 }
 
-function loadFromStorage(): {
-  conversations: Conversation[];
-  currentId: string | null;
-  model: string;
-  systemPrompt: string;
-  numCtx: number;
-  ragEnabled: boolean;
-  ragTopK: number;
-  ragChunkSize: number;
-  ragOverlap: number;
-  embeddingModel: string;
-} {
+/**
+ * 从 localStorage 读取“轻量设置层”（不含会话/文档大数据）。
+ * 失败则回退 DEFAULT_SETTINGS，保证应用可启动。
+ */
+function loadSettingsFromLocalStorage(): SettingsState {
   try {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (!stored)
-      return {
-        conversations: [],
-        currentId: null,
-        model: 'deepseek-r1',
-        systemPrompt: '',
-        numCtx: 8192,
-        ragEnabled: false,
-        ragTopK: 4,
-        ragChunkSize: 900,
-        ragOverlap: 150,
-        embeddingModel: 'mxbai-embed-large',
-      };
+    const stored = localStorage.getItem(SETTINGS_KEY);
+    if (!stored) return DEFAULT_SETTINGS;
+    const data = JSON.parse(stored) as Partial<SettingsState> | null;
+    return {
+      ...DEFAULT_SETTINGS,
+      ...(data ?? {}),
+    };
+  } catch {
+    return DEFAULT_SETTINGS;
+  }
+}
+
+/**
+ * 从旧版 localStorage bundle 读取 legacy 数据，用于一次性迁移到 IndexedDB：
+ * - 早期版本可能是 { chat: Message[] }
+ * - 新一点可能是 { conversations: Conversation[] }
+ */
+function loadLegacyBundleFromLocalStorage():
+  | { conversations: Conversation[]; settings: Partial<SettingsState> }
+  | null {
+  try {
+    const stored = localStorage.getItem(LEGACY_STORAGE_KEY);
+    if (!stored) return null;
     const data = JSON.parse(stored);
-    if (
-      Array.isArray(data.chat) &&
-      data.chat.length > 0 &&
-      !data.conversations
-    ) {
+    // 早期：{ chat: Message[], ...settings }
+    if (Array.isArray(data.chat) && data.chat.length > 0 && !data.conversations) {
       const conv: Conversation = {
         id: generateId(),
         title: '历史对话',
@@ -65,48 +106,45 @@ function loadFromStorage(): {
       };
       return {
         conversations: [conv],
-        currentId: conv.id,
-        model: data.model ?? 'deepseek-r1',
-        systemPrompt: data.systemPrompt ?? '',
-        numCtx: data.numCtx ?? 8192,
-        ragEnabled: data.ragEnabled ?? false,
-        ragTopK: data.ragTopK ?? 4,
-        ragChunkSize: data.ragChunkSize ?? 900,
-        ragOverlap: data.ragOverlap ?? 150,
-        embeddingModel: data.embeddingModel ?? 'mxbai-embed-large',
+        settings: {
+          currentId: conv.id,
+          model: data.model,
+          systemPrompt: data.systemPrompt,
+          numCtx: data.numCtx,
+          ragEnabled: data.ragEnabled,
+          ragTopK: data.ragTopK,
+          ragChunkSize: data.ragChunkSize,
+          ragOverlap: data.ragOverlap,
+          embeddingModel: data.embeddingModel,
+        },
       };
     }
-    const conversations = Array.isArray(data.conversations)
-      ? data.conversations
-      : [];
+    const conversations = Array.isArray(data.conversations) ? data.conversations : [];
+    if (conversations.length === 0) return null;
     return {
       conversations,
-      currentId: data.currentId ?? conversations[0]?.id ?? null,
-      model: data.model ?? 'deepseek-r1',
-      systemPrompt: data.systemPrompt ?? '',
-      numCtx: data.numCtx ?? 8192,
-      ragEnabled: data.ragEnabled ?? false,
-      ragTopK: data.ragTopK ?? 4,
-      ragChunkSize: data.ragChunkSize ?? 900,
-      ragOverlap: data.ragOverlap ?? 150,
-      embeddingModel: data.embeddingModel ?? 'mxbai-embed-large',
+      settings: {
+        currentId: data.currentId ?? conversations[0]?.id ?? null,
+        model: data.model,
+        systemPrompt: data.systemPrompt,
+        numCtx: data.numCtx,
+        ragEnabled: data.ragEnabled,
+        ragTopK: data.ragTopK,
+        ragChunkSize: data.ragChunkSize,
+        ragOverlap: data.ragOverlap,
+        embeddingModel: data.embeddingModel,
+      },
     };
   } catch {
-    return {
-      conversations: [],
-      currentId: null,
-      model: 'deepseek-r1',
-      systemPrompt: '',
-      numCtx: 8192,
-      ragEnabled: false,
-      ragTopK: 4,
-      ragChunkSize: 900,
-      ragOverlap: 150,
-      embeddingModel: 'mxbai-embed-large',
-    };
+    return null;
   }
 }
 
+/**
+ * Home：应用主页面。
+ * - 设置：localStorage（轻量、读取快）
+ * - 会话/文档/embedding 缓存：IndexedDB（容量大、异步、适合长期增长）
+ */
 export default function Home() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [currentId, setCurrentId] = useState<string | null>(null);
@@ -135,6 +173,7 @@ export default function Home() {
   const [isHydrated, setIsHydrated] = useState(false);
   const [docs, setDocs] = useState<DocItem[]>([]);
   const [activeDocId, setActiveDocId] = useState<string | null>(null);
+  const docsRef = useRef<DocItem[]>([]);
 
   const selectedDocs = docs.filter((d) => d.checked);
   const selectedDocsContent = selectedDocs.map((d) => d.content).join('\n\n');
@@ -142,27 +181,92 @@ export default function Home() {
   const isContextTooLong = selectedDocsCharCount > 5000;
 
   useEffect(() => {
-    const data = loadFromStorage();
-    setConversations(data.conversations);
-    setCurrentId(data.currentId);
-    setModel(data.model);
-    setSystemPrompt(data.systemPrompt);
-    setNumCtx(data.numCtx);
-    setRagEnabled(data.ragEnabled);
-    setRagTopK(data.ragTopK);
-    setRagChunkSize(data.ragChunkSize);
-    setRagOverlap(data.ragOverlap);
-    setEmbeddingModel(data.embeddingModel);
-    setIsHydrated(true);
+    let cancelled = false;
+    (async () => {
+      // 1) 先加载设置（localStorage）
+      const settings = loadSettingsFromLocalStorage();
+      if (cancelled) return;
+      setCurrentId(settings.currentId);
+      setModel(settings.model);
+      setSystemPrompt(settings.systemPrompt);
+      setNumCtx(settings.numCtx);
+      setRagEnabled(settings.ragEnabled);
+      setRagTopK(settings.ragTopK);
+      setRagChunkSize(settings.ragChunkSize);
+      setRagOverlap(settings.ragOverlap);
+      setEmbeddingModel(settings.embeddingModel);
+
+      // 2) 兼容旧 localStorage 一次性迁移到 IndexedDB
+      const legacy = loadLegacyBundleFromLocalStorage();
+      if (legacy) {
+        // 迁移原则：以“新设置层”为底，再合并 legacy 中可能存在的字段
+        const mergedSettings: SettingsState = {
+          ...settings,
+          ...(legacy.settings ?? {}),
+        };
+        if (legacy.conversations?.length) {
+          await replaceAllConversations(legacy.conversations);
+        }
+        try {
+          localStorage.setItem(SETTINGS_KEY, JSON.stringify(mergedSettings));
+          localStorage.removeItem(LEGACY_STORAGE_KEY);
+        } catch {
+          // ignore
+        }
+        if (cancelled) return;
+        setCurrentId(mergedSettings.currentId);
+        setModel(mergedSettings.model);
+        setSystemPrompt(mergedSettings.systemPrompt);
+        setNumCtx(mergedSettings.numCtx);
+        setRagEnabled(mergedSettings.ragEnabled);
+        setRagTopK(mergedSettings.ragTopK);
+        setRagChunkSize(mergedSettings.ragChunkSize);
+        setRagOverlap(mergedSettings.ragOverlap);
+        setEmbeddingModel(mergedSettings.embeddingModel);
+      }
+
+      // 3) 加载会话（IndexedDB）
+      const convs = await getAllConversations();
+      if (cancelled) return;
+      setConversations(convs);
+      setCurrentId((cur) => cur ?? convs[0]?.id ?? null);
+
+      // 4) 加载文档（IndexedDB）
+      const storedDocs = await getAllDocs();
+      if (cancelled) return;
+      // 从 IndexedDB 读取时会为 pdf(blob) 重建 objectUrl，保证刷新后仍可预览
+      const loadedDocs = storedDocs.map(toDocItem);
+      setDocs(loadedDocs);
+      setActiveDocId((cur) => cur ?? loadedDocs[0]?.id ?? null);
+
+      setIsHydrated(true);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    // docsRef 仅用于卸载时统一回收 objectUrl，避免闭包拿到旧 docs
+    docsRef.current = docs;
+  }, [docs]);
+
+  useEffect(() => {
+    // 组件卸载时清理 objectUrl，避免内存泄漏
+    return () => {
+      for (const d of docsRef.current) {
+        if (d.objectUrl) URL.revokeObjectURL(d.objectUrl);
+      }
+    };
   }, []);
 
   useEffect(() => {
     if (!isHydrated) return;
     try {
       localStorage.setItem(
-        STORAGE_KEY,
+        SETTINGS_KEY,
         JSON.stringify({
-          conversations,
           currentId,
           model,
           systemPrompt,
@@ -178,7 +282,6 @@ export default function Home() {
       // localStorage 可能已满
     }
   }, [
-    conversations,
     currentId,
     model,
     systemPrompt,
@@ -194,30 +297,51 @@ export default function Home() {
   const currentConversation = conversations.find((c) => c.id === currentId);
   const messages = currentConversation?.messages ?? [];
 
+  /**
+   * 更新会话的统一入口（内存 state + IndexedDB 持久化）。
+   * 设计为“传入 updater”：
+   * - 便于在流式输出时高频更新最后一条 assistant 消息
+   * - 避免分散在各处的 setConversations + DB 写入导致不一致
+   */
   const updateConversation = useCallback(
     (id: string, updater: (c: Conversation) => Conversation) => {
+      let nextConv: Conversation | null = null;
       setConversations((prev) => {
         const found = prev.find((c) => c.id === id);
         if (found) {
-          return prev.map((c) => (c.id === id ? updater(c) : c));
+          nextConv = updater(found);
+          return prev.map((c) => (c.id === id ? nextConv! : c));
         }
         const created: Conversation = {
           id,
           title: '新对话',
           messages: [],
         };
-        return [updater(created), ...prev];
+        nextConv = updater(created);
+        return [nextConv, ...prev];
       });
+      if (nextConv) {
+        void upsertConversation(nextConv).catch(() => null);
+      }
     },
     [],
   );
 
+  /**
+   * 生成会话标题（异步）：
+   * - 当对话出现前两句后触发一次（见 send() 末尾）
+   * - titleGenerated 用于“防重复触发/失败可重试”的状态标记
+   */
   const fetchTitle = useCallback(
     async (convId: string, msgs: Message[]) => {
       if (msgs.length < 2) return;
-      setConversations((prev) =>
-        prev.map((c) => (c.id === convId ? { ...c, titleGenerated: true } : c)),
-      );
+      setConversations((prev) => {
+        const found = prev.find((c) => c.id === convId);
+        if (!found) return prev;
+        const next = { ...found, titleGenerated: true };
+        void upsertConversation(next).catch(() => null);
+        return prev.map((c) => (c.id === convId ? next : c));
+      });
       try {
         const res = await fetch('/api/title', {
           method: 'POST',
@@ -225,30 +349,39 @@ export default function Home() {
           body: JSON.stringify({ messages: msgs.slice(0, 2), model }),
         });
         if (!res.ok) {
-          setConversations((prev) =>
-            prev.map((c) =>
-              c.id === convId ? { ...c, titleGenerated: false } : c,
-            ),
-          );
+          setConversations((prev) => {
+            const found = prev.find((c) => c.id === convId);
+            if (!found) return prev;
+            const next = { ...found, titleGenerated: false };
+            void upsertConversation(next).catch(() => null);
+            return prev.map((c) => (c.id === convId ? next : c));
+          });
           return;
         }
         const { title } = await res.json();
         if (title) {
-          setConversations((prev) =>
-            prev.map((c) => (c.id === convId ? { ...c, title } : c)),
-          );
+          setConversations((prev) => {
+            const found = prev.find((c) => c.id === convId);
+            if (!found) return prev;
+            const next = { ...found, title };
+            void upsertConversation(next).catch(() => null);
+            return prev.map((c) => (c.id === convId ? next : c));
+          });
         }
       } catch {
-        setConversations((prev) =>
-          prev.map((c) =>
-            c.id === convId ? { ...c, titleGenerated: false } : c,
-          ),
-        );
+        setConversations((prev) => {
+          const found = prev.find((c) => c.id === convId);
+          if (!found) return prev;
+          const next = { ...found, titleGenerated: false };
+          void upsertConversation(next).catch(() => null);
+          return prev.map((c) => (c.id === convId ? next : c));
+        });
       }
     },
     [model],
   );
 
+  /** 新建空会话并切换为当前会话（同时写入 IndexedDB）。 */
   const createConversation = useCallback(() => {
     const newConv: Conversation = {
       id: generateId(),
@@ -257,8 +390,14 @@ export default function Home() {
     };
     setConversations((prev) => [newConv, ...prev]);
     setCurrentId(newConv.id);
+    void upsertConversation(newConv).catch(() => null);
   }, []);
 
+  /**
+   * 删除会话：
+   * - 需要 stopPropagation，避免触发 Sidebar 的 onSelect
+   * - 若删除当前会话，则自动切到列表第一条（或置空）
+   */
   const deleteConversation = useCallback(
     (id: string, e: React.MouseEvent) => {
       e.stopPropagation();
@@ -269,10 +408,19 @@ export default function Home() {
         }
         return next;
       });
+      void removeConversationFromDb(id).catch(() => null);
     },
     [currentId],
   );
 
+  /**
+   * 发送消息主流程：
+   * 1) 保障存在 activeId（无会话则自动创建）
+   * 2) 写入 user 消息 + loading
+   * 3) RAG（可选）：本地检索 -> 注入到 system prompt
+   * 4) 调用 /api/chat 流式返回并持续更新 assistant 消息
+   * 5) 结束后触发标题生成（若尚未生成）
+   */
   const send = async () => {
     if (!input.trim() || isLoading) return;
 
@@ -285,6 +433,7 @@ export default function Home() {
       };
       setConversations((prev) => [newConv, ...prev]);
       setCurrentId(newConv.id);
+      void upsertConversation(newConv).catch(() => null);
       activeId = newConv.id;
     }
 
@@ -308,53 +457,28 @@ export default function Home() {
     let contextPrefix = '';
     if (ragEnabled && selectedDocs.length > 0) {
       try {
-        const res = await fetch('/api/rag', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            query: userMessage,
-            docs: selectedDocs.map((d) => ({
-              id: d.id,
-              name: d.name,
-              content: d.content,
-              kind: d.kind,
-              pages: d.pages,
-            })),
-            topK: ragTopK,
-            chunkSize: ragChunkSize,
-            overlap: ragOverlap,
-            embeddingModel,
-          }),
+        // RAG 选择在前端本地做：
+        // - 文档/切片与 embedding 缓存都在 IndexedDB，避免每次都把大文档传回服务端
+        // - embedding 请求仍通过 /api/embed 走本机 Ollama，但命中缓存时不会重复计算
+        // - 引用信息（页码/标题）可直接用于右侧“论文式引用”跳转与高亮
+        const hits = await retrieveRagHits({
+          query: userMessage,
+          docs: selectedDocs,
+          topK: ragTopK,
+          chunkSize: ragChunkSize,
+          overlap: ragOverlap,
+          embeddingModel,
         });
-        if (res.ok) {
-          setRagError(null);
-          const data = (await res.json()) as {
-            chunks: Array<{
-              docId: string;
-              docName: string;
-              chunk: string;
-              score: number;
-              pageStart?: number;
-              pageEnd?: number;
-              heading?: string;
-            }>;
-          };
-          setRagHits(data.chunks ?? []);
-          const lines = (data.chunks ?? [])
-            .map(
-              (c, idx) =>
-                `【片段${idx + 1}｜${c.docName}${c.pageStart ? `｜p${c.pageStart}${c.pageEnd && c.pageEnd !== c.pageStart ? `-${c.pageEnd}` : ''}` : ''}${c.heading ? `｜${c.heading}` : ''}｜score=${c.score.toFixed(3)}】\n${c.chunk}`,
-            )
-            .join('\n\n');
-          if (lines) {
-            contextPrefix = `请仅根据以下检索到的资料回答问题（若资料不足请说明）：\n${lines}\n\n`;
-          }
-        } else {
-          const err = await res.json().catch(() => null as any);
-          const msg = err?.error ?? res.statusText;
-          setRagError(String(msg));
-          setRagHits([]);
-          console.warn('RAG 请求失败，将降级为全量注入', msg);
+        setRagError(null);
+        setRagHits(hits);
+        const lines = hits
+          .map(
+            (c, idx) =>
+              `【片段${idx + 1}｜${c.docName}${c.pageStart ? `｜p${c.pageStart}${c.pageEnd && c.pageEnd !== c.pageStart ? `-${c.pageEnd}` : ''}` : ''}${c.heading ? `｜${c.heading}` : ''}｜score=${c.score.toFixed(3)}】\n${c.chunk}`,
+          )
+          .join('\n\n');
+        if (lines) {
+          contextPrefix = `请仅根据以下检索到的资料回答问题（若资料不足请说明）：\n${lines}\n\n`;
         }
       } catch (e) {
         setRagError(e instanceof Error ? e.message : 'RAG 请求异常');
@@ -438,19 +562,30 @@ export default function Home() {
     }
   };
 
+  /** 输入框发送入口：仅在“有内容且不在 loading”时触发 send()。 */
   const handleSendFromInput = () => {
     if (input.trim() && !isLoading) send();
   };
 
+  /**
+   * 从 File 构建 DocItem：
+   * - txt/md：直接读取文本
+   * - pdf：用 pdfjs 解析每页文本（用于 RAG/页码引用），同时保存 blob 以便刷新后预览
+   */
   const addDocFromFile = async (file: File) => {
     const id = generateId();
     let content = '';
     let kind: DocItem['kind'] = 'txt';
     let objectUrl: string | undefined;
     let pages: DocItem['pages'];
+    let blob: Blob | undefined;
 
     if (/\.pdf$/i.test(file.name)) {
       kind = 'pdf';
+      // PDF 需要持久化 blob：
+      // - 右侧预览依赖 objectUrl，但 objectUrl 不能跨刷新保存
+      // - 保存 blob 到 IndexedDB 后，刷新时可以重建 objectUrl，实现“文档仍可预览”
+      blob = file;
       objectUrl = URL.createObjectURL(file);
       const pdfjs = await import('pdfjs-dist');
       if (typeof window !== 'undefined') {
@@ -487,14 +622,30 @@ export default function Home() {
       content,
       kind,
       objectUrl,
+      blob,
       pages,
       checked: true,
     };
 
     setDocs((prev) => [doc, ...prev]);
     setActiveDocId((prev) => prev ?? id);
+    void upsertDoc({
+      id,
+      name: file.name,
+      content,
+      kind,
+      pages,
+      checked: true,
+      blob,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }).catch(() => null);
   };
 
+  /**
+   * 上传文件 change handler：
+   * - 解析后把 input.value 清空，保证“选择同一个文件”也能再次触发 change
+   */
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const inputEl = e.target;
     const file = inputEl.files?.[0];
@@ -506,12 +657,37 @@ export default function Home() {
     }
   };
 
+  /**
+   * 切换文档是否参与上下文注入（checked）：
+   * - 更新 UI 状态
+   * - 同步写入 IndexedDB，保证刷新后仍保持勾选
+   */
   const toggleDocChecked = (id: string) => {
-    setDocs((prev) =>
-      prev.map((d) => (d.id === id ? { ...d, checked: !d.checked } : d)),
-    );
+    setDocs((prev) => {
+      const target = prev.find((d) => d.id === id);
+      if (!target) return prev;
+      const nextDoc = { ...target, checked: !target.checked };
+      void upsertDoc({
+        id: nextDoc.id,
+        name: nextDoc.name,
+        content: nextDoc.content,
+        kind: nextDoc.kind,
+        pages: nextDoc.pages,
+        checked: nextDoc.checked,
+        blob: nextDoc.blob,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }).catch(() => null);
+      return prev.map((d) => (d.id === id ? nextDoc : d));
+    });
   };
 
+  /**
+   * 删除文档：
+   * - 先 revoke objectUrl 释放内存
+   * - 若删除的是当前预览文档，则切到下一条/置空
+   * - 同步删除 IndexedDB 记录
+   */
   const removeDoc = (id: string) => {
     setDocs((prev) => {
       const target = prev.find((d) => d.id === id);
@@ -520,6 +696,7 @@ export default function Home() {
       setActiveDocId((cur) => (cur === id ? (next[0]?.id ?? null) : cur));
       return next;
     });
+    void removeDocFromDb(id).catch(() => null);
   };
 
   if (!isHydrated) {

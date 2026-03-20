@@ -1,10 +1,10 @@
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { ModelSelect } from '@/components/ModelSelect';
 import { Sidebar } from '@/components/Sidebar';
 import { ChatWindow } from '@/components/ChatWindow';
 import { SettingsDialog } from '@/components/SettingsDialog';
+import { ImageGenerateDialog } from '@/components/ImageGenerateDialog';
 import type { Conversation, Message, DocItem } from '@/lib/types';
 import {
   getAllConversations,
@@ -23,8 +23,11 @@ import { retrieveRagHits } from '@/lib/rag/client';
 const LEGACY_STORAGE_KEY = 'ai-local-app-chat';
 const SETTINGS_KEY = 'ai-local-app:settings:v1';
 
-/** 勾选图片提问时使用的视觉模型，固定为 llava（需本机 ollama 已安装）。 */
+/** 勾选图片提问时使用的视觉模型（需本机 ollama 已安装）。 */
 const VISION_MODEL = 'llava';
+
+/** 图片生成模型（Ollama 实验性图像生成，需本机已拉取）。 */
+const IMAGE_GEN_MODELS = ['x/flux2-klein', 'x/z-image-turbo'] as const;
 
 type SettingsState = {
   currentId: string | null;
@@ -189,7 +192,11 @@ export default function Home() {
   const selectedDocs = docs.filter((d) => d.checked);
   const selectedDocsContent = selectedDocs
     .filter(
-      (d) => d.kind !== 'img' || (d.visionSummary ?? '').trim().length > 0,
+      (d) =>
+        d.kind === 'txt' ||
+        d.kind === 'md' ||
+        d.kind === 'pdf' ||
+        (d.kind === 'img' && (d.visionSummary ?? '').trim().length > 0),
     )
     .map((d) => {
       if (d.kind !== 'img') return d.content;
@@ -479,37 +486,65 @@ export default function Home() {
     setCurrentId(activeId);
     setIsLoading(true);
 
-    // 仅携带「当前已上传且已勾选」的图片；已删除或未勾选的不带入对话
-    const selectedImageDocs = docs.filter(
-      (d) => d.checked && d.kind === 'img' && !!d.blob,
-    );
-    const hasImages = selectedImageDocs.length > 0;
+    // 仅携带「当前已上传且已勾选」的视觉媒体（图片/视频）；已删除或未勾选的不带入对话
+    const selectedImageDocs = docs.filter((d) => d.checked && d.kind === 'img' && !!d.blob);
+    const selectedVideoDocs = docs.filter((d) => d.checked && d.kind === 'video' && !!d.blob);
+    const hasVisualMedia = selectedImageDocs.length > 0 || selectedVideoDocs.length > 0;
 
     try {
-      // 勾选图片时：走 /api/chat（多模态），支持多轮追问 + 流式输出
-      // 发送前再校验一次（docsRef 为最新），避免用户已取消勾选/删除时仍带图
-      if (hasImages) {
-        const currentImageDocs = docsRef.current.filter(
-          (d) => d.checked && d.kind === 'img' && !!d.blob,
+      // 勾选图片/视频时：走 /api/chat（多模态），支持多轮追问 + 流式输出
+      // 发送前再校验一次（docsRef 为最新），避免用户已取消勾选/删除时仍带入旧媒体
+      if (hasVisualMedia) {
+        const currentImageDocs = docsRef.current.filter((d) => d.checked && d.kind === 'img' && !!d.blob);
+        const currentVideoDocs = docsRef.current.filter((d) => d.checked && d.kind === 'video' && !!d.blob);
+
+        const imageBases = await Promise.all(
+          currentImageDocs.slice(0, 2).map((d) => blobToBase64(d.blob!)),
         );
-        if (currentImageDocs.length > 0) {
-          const imageBases = await Promise.all(
-            currentImageDocs.slice(0, 2).map((d) => blobToBase64(d.blob!)),
-          );
-          const systemContent =
-            (systemPrompt.trim() || '请用中文回答，结合用户上传并勾选的图片进行分析作答。').trim();
-          const messagesWithImages: any[] = newMessages.map((m, i) => {
-            const isLastUser =
-              i === newMessages.length - 1 && m.role === 'user';
+
+        // 从视频抽帧，转成 base64 图片（base64 part，不带 dataURL 前缀）
+        const videoFramesBases: string[] = [];
+        if (currentVideoDocs.length > 0) {
+          const frameDocs = currentVideoDocs.slice(0, 1);
+          for (const d of frameDocs) {
+            if (!d.objectUrl) continue;
+            try {
+              const frames = await extractVideoFramesBase64(d.objectUrl, {
+                frameCount: 3,
+                maxWidth: 768,
+              });
+              videoFramesBases.push(...frames);
+            } catch {
+              // 抽帧失败：忽略该视频，让后续仍可基于图片/文本继续
+            }
+          }
+        }
+
+        const combinedImages = [...imageBases, ...videoFramesBases].filter(Boolean);
+        if (combinedImages.length > 0) {
+          const systemContent = (
+            systemPrompt.trim() ||
+            '请用中文分析并回答，结合用户上传并勾选的图片与视频帧进行分析作答。'
+          ).trim();
+
+          const usedVideo = currentVideoDocs.length > 0 && videoFramesBases.length > 0;
+
+          type VisionMessage = Message & { images?: string[] };
+          const messagesWithImages: VisionMessage[] = newMessages.map((m, i) => {
+            const isLastUser = i === newMessages.length - 1 && m.role === 'user';
             if (isLastUser) {
               return {
+                ...m,
                 role: 'user' as const,
-                content: `请用中文描述，${m.content}`,
-                images: imageBases,
+                content: usedVideo
+                  ? `请用中文分析并回答：${m.content}`
+                  : `请用中文描述并回答：${m.content}`,
+                images: combinedImages,
               };
             }
             return m;
           });
+
           const messagesToSend =
             systemContent === ''
               ? messagesWithImages
@@ -526,7 +561,7 @@ export default function Home() {
           });
           if (!res.ok) {
             const err = await res.json().catch(() => ({ error: res.statusText }));
-            throw new Error(err.error || `图片分析失败: ${res.status}`);
+            throw new Error(err.error || `视觉分析失败: ${res.status}`);
           }
 
           const reader = res.body?.getReader();
@@ -556,9 +591,10 @@ export default function Home() {
           }
           return;
         }
+        // 抽帧失败或未带入媒体：回落到纯文本/RAG
       }
 
-      // 无图片勾选（或校验时已取消）：走 chat 流程（RAG + system prompt）
+      // 无视觉媒体勾选（或校验时已取消 / 抽帧失败）：走 chat 流程（RAG + system prompt）
       const trimmedSystem = systemPrompt.trim();
       let contextPrefix = '';
       if (ragEnabled && selectedDocs.length > 0) {
@@ -679,6 +715,12 @@ export default function Home() {
       blob = file;
       objectUrl = URL.createObjectURL(file);
       content = '';
+    } else if (/\.(mp4|webm|mov|mkv)$/i.test(file.name)) {
+      // 视频：不做自动转写/抽帧持久化，抽帧发生在用户“发送问题”时
+      kind = 'video';
+      blob = file;
+      objectUrl = URL.createObjectURL(file);
+      content = '';
     } else if (/\.pdf$/i.test(file.name)) {
       kind = 'pdf';
       // PDF 需要持久化 blob：
@@ -697,8 +739,8 @@ export default function Home() {
       for (let i = 1; i <= pdf.numPages; i += 1) {
         const page = await pdf.getPage(i);
         const textContent = await page.getTextContent();
-        const pageText = (textContent.items as any[])
-          .map((item) => item.str)
+        const pageText = (textContent.items as Array<{ str?: string }>)
+          .map((item) => item.str ?? '')
           .join(' ');
         extractedPages.push({ page: i, text: pageText });
         fullText += `${pageText}\n`;
@@ -757,7 +799,220 @@ export default function Home() {
     return btoa(binary);
   };
 
-  // 图片分析仅依赖视觉模型（VLM）。
+  /**
+   * 视频抽帧 -> base64 图片（base64 part，不带 dataURL 前缀）
+   * - 用于把本地视频“变成图片数组”，再复用现有 /api/chat 多模态能力
+   */
+  const extractVideoFramesBase64 = async (
+    videoSrc: string,
+    params: { frameCount: number; maxWidth: number },
+  ): Promise<string[]> => {
+    const { frameCount, maxWidth } = params;
+    if (!frameCount || frameCount < 1) return [];
+
+    const video = document.createElement('video');
+    video.src = videoSrc;
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = 'metadata';
+
+    const waitForLoadedMetadata = () =>
+      new Promise<void>((resolve, reject) => {
+        const onLoaded = () => {
+          video.removeEventListener('loadedmetadata', onLoaded);
+          resolve();
+        };
+        const onError = () => {
+          video.removeEventListener('error', onError);
+          reject(new Error('video loadedmetadata failed'));
+        };
+        video.addEventListener('loadedmetadata', onLoaded);
+        video.addEventListener('error', onError);
+      });
+
+    await waitForLoadedMetadata();
+
+    const duration = Number.isFinite(video.duration) ? video.duration : 0;
+    const videoW = video.videoWidth || 640;
+    const videoH = video.videoHeight || 480;
+
+    if (!duration || duration <= 0) return [];
+
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return [];
+
+    const scale = Math.min(1, maxWidth / Math.max(1, videoW));
+    canvas.width = Math.max(1, Math.floor(videoW * scale));
+    canvas.height = Math.max(1, Math.floor(videoH * scale));
+
+    const times = Array.from({ length: frameCount }, (_, idx) => {
+      const t = frameCount === 1 ? 0.5 : idx / (frameCount - 1);
+      // 避免取到视频开头/结尾黑帧：加一点点偏移
+      return Math.max(0, Math.min(duration, t * duration));
+    });
+
+    const seekTo = (time: number) =>
+      new Promise<void>((resolve, reject) => {
+        const onError = () => {
+          video.removeEventListener('seeked', onSeeked);
+          video.removeEventListener('error', onError);
+          reject(new Error('video seek failed'));
+        };
+
+        const onSeeked = () => {
+          video.removeEventListener('seeked', onSeeked);
+          video.removeEventListener('error', onError);
+          resolve();
+        };
+        video.addEventListener('seeked', onSeeked);
+        video.addEventListener('error', onError);
+        video.currentTime = Math.max(0, Math.min(duration, time));
+      });
+
+    const frames: string[] = [];
+
+    for (const t of times) {
+      try {
+        await seekTo(t);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+        const base64 = dataUrl.split(',')[1];
+        if (base64) frames.push(base64);
+      } catch {
+        // 单帧失败不应中断全流程
+      }
+    }
+
+    try {
+      video.pause();
+      video.src = '';
+    } catch {
+      // ignore
+    }
+
+    return frames;
+  };
+
+  /** base64 -> Blob（用于把图片生成结果加入右侧文档栏） */
+  const base64ToBlob = (base64: string, mimeType: string): Blob => {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new Blob([bytes], { type: mimeType });
+  };
+
+  /**
+   * 图片生成入口：调用 /api/image-generate，得到 base64 后加入 docs（kind=img）
+   * 并在当前会话追加一句 assistant 说明。
+   */
+  const handleGenerateImage = async (prompt: string) => {
+    if (isLoading) throw new Error('当前正在对话中，请稍后再生成图片');
+
+    let activeId = currentId;
+    let existingConv = currentId ? conversations.find((c) => c.id === currentId) : null;
+    let baseMessages: Message[] = existingConv?.messages ?? [];
+
+    if (!activeId) {
+      existingConv = null;
+      baseMessages = [];
+      activeId = generateId();
+      setCurrentId(activeId);
+    }
+
+    try {
+      let lastErr: Error | null = null;
+      let data: { imageBase64: string; mimeType: string } | null = null;
+
+      for (const genModel of IMAGE_GEN_MODELS) {
+        try {
+          const res = await fetch('/api/image-generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt, model: genModel }),
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({ error: res.statusText }));
+            throw new Error(err.error || `图片生成失败: ${res.status}`);
+          }
+          data = (await res.json()) as { imageBase64: string; mimeType: string };
+          break;
+        } catch (e) {
+          lastErr = e instanceof Error ? e : new Error('图片生成失败');
+          data = null;
+        }
+      }
+
+      if (!data?.imageBase64) {
+        throw lastErr ?? new Error('图片生成失败：无可用图像生成模型');
+      }
+
+      const imageBase64 = data.imageBase64?.trim();
+      const mimeType = data.mimeType || 'image/png';
+      if (!imageBase64) throw new Error('生成结果为空');
+
+      const blob = base64ToBlob(imageBase64, mimeType);
+      const objectUrl = URL.createObjectURL(blob);
+      const id = generateId();
+      const ext = mimeType.includes('jpeg')
+        ? 'jpg'
+        : mimeType.includes('webp')
+          ? 'webp'
+          : mimeType.includes('gif')
+            ? 'gif'
+            : 'png';
+      const doc: DocItem = {
+        id,
+        name: `生成图片_${new Date().toLocaleTimeString()}.${ext}`,
+        content: '',
+        kind: 'img',
+        objectUrl,
+        blob,
+        pages: undefined,
+        checked: true,
+        visionSummary: '',
+        visionStatus: 'none',
+      };
+
+      setDocs((prev) => [doc, ...prev]);
+      setActiveDocId(id);
+
+      void upsertDoc({
+        id: doc.id,
+        name: doc.name,
+        content: doc.content,
+        kind: doc.kind,
+        pages: doc.pages,
+        checked: doc.checked,
+        blob: doc.blob,
+        visionSummary: doc.visionSummary,
+        visionStatus: doc.visionStatus,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }).catch(() => null);
+
+      // 给对话追加一条说明（不把 base64 写进 messages，避免膨胀 IndexedDB）
+      const assistantMsg: Message = {
+        role: 'assistant',
+        content: '已生成图片，已加入右侧文档栏（可在需要时保持勾选用于后续对话）。',
+      };
+
+      updateConversation(activeId, (c) => ({ ...c, messages: [...c.messages, assistantMsg] }));
+
+      const finalMessages = [...baseMessages, assistantMsg];
+      if (finalMessages.length >= 2 && !(existingConv?.titleGenerated ?? false)) {
+        fetchTitle(activeId, finalMessages);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : '图片生成出错';
+      const assistantMsg: Message = { role: 'assistant', content: `错误: ${msg}` };
+      updateConversation(activeId!, (c) => ({ ...c, messages: [...c.messages, assistantMsg] }));
+    }
+  };
+
+  // 图片/视频分析仅依赖视觉模型（VLM）。
 
   /**
    * 上传文件 change handler：
@@ -845,6 +1100,7 @@ export default function Home() {
               {currentConversation?.title ?? 'My Local AI'}
             </h1>
             <div className="flex items-center gap-2">
+              <ImageGenerateDialog onGenerate={handleGenerateImage} />
               <SettingsDialog
                 model={model}
                 setModel={setModel}

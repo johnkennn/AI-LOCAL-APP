@@ -230,7 +230,7 @@ export function ChatWindow({
                   + 添加
                   <input
                     type="file"
-                    accept=".txt,.md,.pdf,.png,.jpg,.jpeg,.webp,.gif"
+                    accept=".txt,.md,.pdf,.png,.jpg,.jpeg,.webp,.gif,.mp4,.webm,.mov,.mkv"
                     className="hidden"
                     onChange={onFileChange}
                   />
@@ -280,7 +280,11 @@ export function ChatWindow({
                       </div>
                       <div className="text-[11px] text-zinc-400">
                         {d.kind.toUpperCase()} ·{' '}
-                        {d.kind === 'img' ? '图片' : `${d.content.length} 字`}
+                        {d.kind === 'img'
+                          ? '图片'
+                          : d.kind === 'video'
+                            ? '视频'
+                            : `${d.content.length} 字`}
                       </div>
                     </div>
                     <button
@@ -384,6 +388,14 @@ export function ChatWindow({
                   src={activeDoc.objectUrl}
                   alt={activeDoc.name}
                   className="max-h-full w-full object-contain rounded"
+                />
+              </div>
+            ) : activeDoc.kind === 'video' && activeDoc.objectUrl ? (
+              <div className="h-full overflow-hidden rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900">
+                <video
+                  src={activeDoc.objectUrl}
+                  controls
+                  className="h-full w-full object-contain"
                 />
               </div>
             ) : (

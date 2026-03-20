@@ -18,7 +18,10 @@ export async function POST(req: Request) {
     }
 
     const hasImages = Array.isArray(messages)
-      ? messages.some((m: any) => Array.isArray(m?.images) && m.images.length > 0)
+      ? messages.some((m) => {
+          const maybe = m as { images?: unknown };
+          return Array.isArray(maybe.images) && maybe.images.length > 0;
+        })
       : false;
 
     // 优先尝试流式输出（包括多模态），提升交互体验。

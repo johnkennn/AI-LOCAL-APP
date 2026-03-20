@@ -14,7 +14,7 @@ export interface DocItem {
   id: string;
   name: string;
   content: string;
-  kind: 'txt' | 'md' | 'pdf' | 'img';
+  kind: 'txt' | 'md' | 'pdf' | 'img' | 'video';
   objectUrl?: string;
   blob?: Blob;
   pages?: Array<{ page: number; text: string }>;

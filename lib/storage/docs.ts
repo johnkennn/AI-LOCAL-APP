@@ -59,7 +59,7 @@ export function toDocItem(stored: StoredDoc): DocItem {
   const { blob, createdAt: _c, updatedAt: _u, ...rest } = stored;
   // objectUrl 只在内存里有效，不能持久化；刷新后需由 blob 重建
   const objectUrl =
-    (stored.kind === 'pdf' || stored.kind === 'img') && blob
+    (stored.kind === 'pdf' || stored.kind === 'img' || stored.kind === 'video') && blob
       ? URL.createObjectURL(blob)
       : undefined;
   return { ...rest, blob, objectUrl };

@@ -7,6 +7,7 @@ import type { DocItem } from '@/lib/types';
 interface Message {
   role: string;
   content: string;
+  images?: Array<{ mimeType: string; base64: string }>;
 }
 
 interface ChatWindowProps {
@@ -148,7 +149,21 @@ export function ChatWindow({
                         {m.content}
                       </span>
                     ) : (
-                      <MarkdownContent content={m.content} />
+                      <div className="space-y-2">
+                        {m.images && m.images.length > 0 && (
+                          <div className="flex flex-col gap-2">
+                            {m.images.map((img, idx) => (
+                              <img
+                                key={idx}
+                                src={`data:${img.mimeType};base64,${img.base64}`}
+                                alt={img.mimeType}
+                                className="max-w-full rounded-lg border border-zinc-200 dark:border-zinc-700"
+                              />
+                            ))}
+                          </div>
+                        )}
+                        <MarkdownContent content={m.content} />
+                      </div>
                     )}
                   </div>
                 </div>
@@ -196,7 +211,7 @@ export function ChatWindow({
               </button>
             </div>
             <div className="text-[11px] text-zinc-400">
-              Enter 发送 · 右侧勾选的文档会注入上下文
+              Enter 发送 · 右侧勾选的文档会注入上下文 · 支持 `生成图片...`
             </div>
           </div>
         </div>

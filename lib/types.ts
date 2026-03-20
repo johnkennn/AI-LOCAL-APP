@@ -1,6 +1,11 @@
 export interface Message {
   role: string;
   content: string;
+  /**
+   * 图片生成/多模态结果的附件（不通过 Markdown content 承载，避免 content 膨胀）。
+   * 目前仅前端渲染用；持久化到 IndexedDB 的内容体积取决于 base64 大小。
+   */
+  images?: Array<{ mimeType: string; base64: string }>;
 }
 
 export interface Conversation {

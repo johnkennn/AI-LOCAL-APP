@@ -4,7 +4,6 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { Sidebar } from '@/components/Sidebar';
 import { ChatWindow } from '@/components/ChatWindow';
 import { SettingsDialog } from '@/components/SettingsDialog';
-import { ImageGenerateDialog } from '@/components/ImageGenerateDialog';
 import type { Conversation, Message, DocItem } from '@/lib/types';
 import {
   getAllConversations,
@@ -29,8 +28,8 @@ const VISION_MODEL = 'llava';
 /** 图片生成模型（Ollama 实验性图像生成，需本机已拉取）。 */
 // 按“更省显存 -> 更高画质”排序，优先避免 OOM。
 const IMAGE_GEN_MODELS = [
-  'x/z-image-turbo:latest',
   'x/flux2-klein:4b',
+  'x/z-image-turbo:latest',
   'x/flux2-klein:latest',
 ] as const;
 
@@ -491,17 +490,110 @@ export default function Home() {
     setCurrentId(activeId);
     setIsLoading(true);
 
+    // 消息指令：在输入框中直接生成图片并插入对话
+    // 约定：以 “生成” 开头，且包含 “图片”/“图”
+    const parseImagePromptFromChat = (raw: string): string | null => {
+      const t = raw.trim();
+      if (!/^生成/i.test(t)) return null;
+      if (!(t.includes('图片') || t.includes('图'))) return null;
+      // 去掉前缀 “生成/生成图片/生成图/冒号”
+      const cleaned = t
+        .replace(/^生成(图片|图)?\s*[:：]?\s*/i, '')
+        .replace(/^(一张|一幅|一批|一组)\s*/i, '')
+        .replace(/^(图片|图)\s*/i, '')
+        .trim();
+      return cleaned ? cleaned : null;
+    };
+
+    const imagePrompt = parseImagePromptFromChat(userMessage);
+    if (imagePrompt) {
+      try {
+        let lastErr: Error | null = null;
+        let data: { imageBase64: string; mimeType: string } | null = null;
+
+        for (const genModel of IMAGE_GEN_MODELS) {
+          try {
+            const res = await fetch('/api/image-generate', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ prompt: imagePrompt, model: genModel }),
+            });
+            if (!res.ok) {
+              const err = await res
+                .json()
+                .catch(() => ({ error: res.statusText }));
+              throw new Error(err.error || `图片生成失败: ${res.status}`);
+            }
+            data = (await res.json()) as {
+              imageBase64: string;
+              mimeType: string;
+            };
+            break;
+          } catch (e) {
+            lastErr = e instanceof Error ? e : new Error('图片生成失败');
+            data = null;
+          }
+        }
+
+        if (!data?.imageBase64) {
+          throw lastErr ?? new Error('图片生成失败：无可用图像生成模型');
+        }
+
+        const assistantMsg: Message = {
+          role: 'assistant',
+          content: '已根据你的描述生成图片如上：',
+          images: [
+            {
+              mimeType: data.mimeType || 'image/png',
+              base64: data.imageBase64.trim(),
+            },
+          ],
+        };
+
+        const finalMessages: Message[] = [...newMessages, assistantMsg];
+        updateConversation(activeId, () => ({
+          ...conv,
+          messages: finalMessages,
+        }));
+
+        if (finalMessages.length >= 2 && !conv.titleGenerated) {
+          fetchTitle(activeId, finalMessages);
+        }
+        return;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : '请求出错';
+        const errorMessages: Message[] = [
+          ...newMessages,
+          { role: 'assistant', content: `错误: ${msg}` },
+        ];
+        updateConversation(activeId, () => ({
+          ...conv,
+          messages: errorMessages,
+        }));
+        return;
+      }
+    }
+
     // 仅携带「当前已上传且已勾选」的视觉媒体（图片/视频）；已删除或未勾选的不带入对话
-    const selectedImageDocs = docs.filter((d) => d.checked && d.kind === 'img' && !!d.blob);
-    const selectedVideoDocs = docs.filter((d) => d.checked && d.kind === 'video' && !!d.blob);
-    const hasVisualMedia = selectedImageDocs.length > 0 || selectedVideoDocs.length > 0;
+    const selectedImageDocs = docs.filter(
+      (d) => d.checked && d.kind === 'img' && !!d.blob,
+    );
+    const selectedVideoDocs = docs.filter(
+      (d) => d.checked && d.kind === 'video' && !!d.blob,
+    );
+    const hasVisualMedia =
+      selectedImageDocs.length > 0 || selectedVideoDocs.length > 0;
 
     try {
       // 勾选图片/视频时：走 /api/chat（多模态），支持多轮追问 + 流式输出
       // 发送前再校验一次（docsRef 为最新），避免用户已取消勾选/删除时仍带入旧媒体
       if (hasVisualMedia) {
-        const currentImageDocs = docsRef.current.filter((d) => d.checked && d.kind === 'img' && !!d.blob);
-        const currentVideoDocs = docsRef.current.filter((d) => d.checked && d.kind === 'video' && !!d.blob);
+        const currentImageDocs = docsRef.current.filter(
+          (d) => d.checked && d.kind === 'img' && !!d.blob,
+        );
+        const currentVideoDocs = docsRef.current.filter(
+          (d) => d.checked && d.kind === 'video' && !!d.blob,
+        );
 
         const imageBases = await Promise.all(
           currentImageDocs.slice(0, 2).map((d) => blobToBase64(d.blob!)),
@@ -525,35 +617,44 @@ export default function Home() {
           }
         }
 
-        const combinedImages = [...imageBases, ...videoFramesBases].filter(Boolean);
+        const combinedImages = [...imageBases, ...videoFramesBases].filter(
+          Boolean,
+        );
         if (combinedImages.length > 0) {
           const systemContent = (
             systemPrompt.trim() ||
             '请用中文分析并回答，结合用户上传并勾选的图片与视频帧进行分析作答。'
           ).trim();
 
-          const usedVideo = currentVideoDocs.length > 0 && videoFramesBases.length > 0;
+          const usedVideo =
+            currentVideoDocs.length > 0 && videoFramesBases.length > 0;
 
           type VisionMessage = Message & { images?: string[] };
-          const messagesWithImages: VisionMessage[] = newMessages.map((m, i) => {
-            const isLastUser = i === newMessages.length - 1 && m.role === 'user';
-            if (isLastUser) {
-              return {
-                ...m,
-                role: 'user' as const,
-                content: usedVideo
-                  ? `请用中文分析并回答：${m.content}`
-                  : `请用中文描述并回答：${m.content}`,
-                images: combinedImages,
-              };
-            }
-            return m;
-          });
+          const messagesWithImages: VisionMessage[] = newMessages.map(
+            (m, i) => {
+              const isLastUser =
+                i === newMessages.length - 1 && m.role === 'user';
+              if (isLastUser) {
+                return {
+                  ...m,
+                  role: 'user' as const,
+                  content: usedVideo
+                    ? `请用中文分析并回答：${m.content}`
+                    : `请用中文描述并回答：${m.content}`,
+                  images: combinedImages,
+                };
+              }
+              return m;
+            },
+          );
 
           const messagesToSend =
             systemContent === ''
               ? messagesWithImages
-              : [{ role: 'system' as const, content: systemContent }, ...messagesWithImages];
+              : [
+                  { role: 'system' as const, content: systemContent },
+                  ...messagesWithImages,
+                ];
 
           const res = await fetch('/api/chat', {
             method: 'POST',
@@ -565,7 +666,9 @@ export default function Home() {
             }),
           });
           if (!res.ok) {
-            const err = await res.json().catch(() => ({ error: res.statusText }));
+            const err = await res
+              .json()
+              .catch(() => ({ error: res.statusText }));
             throw new Error(err.error || `视觉分析失败: ${res.status}`);
           }
 
@@ -581,7 +684,10 @@ export default function Home() {
                 ...newMessages,
                 { role: 'assistant', content: assistantContent },
               ];
-              updateConversation(activeId, () => ({ ...conv, messages: updated }));
+              updateConversation(activeId, () => ({
+                ...conv,
+                messages: updated,
+              }));
             }
           }
           const finalMessages: Message[] = assistantContent
@@ -694,7 +800,7 @@ export default function Home() {
     } finally {
       setIsLoading(false);
     }
-  };
+  };;
 
   /** 输入框发送入口：仅在“有内容且不在 loading”时触发 send()。 */
   const handleSendFromInput = () => {
@@ -899,25 +1005,17 @@ export default function Home() {
     return frames;
   };
 
-  /** base64 -> Blob（用于把图片生成结果加入右侧文档栏） */
-  const base64ToBlob = (base64: string, mimeType: string): Blob => {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return new Blob([bytes], { type: mimeType });
-  };
-
   /**
-   * 图片生成入口：调用 /api/image-generate，得到 base64 后加入 docs（kind=img）
-   * 并在当前会话追加一句 assistant 说明。
+   * 图片生成入口：调用 /api/image-generate，把结果作为 assistant 附件插入对话。
+   * （不写入右侧“文档栏”，从而满足“在消息对话中展示”）
    */
   const handleGenerateImage = async (prompt: string) => {
     if (isLoading) throw new Error('当前正在对话中，请稍后再生成图片');
 
     let activeId = currentId;
-    let existingConv = currentId ? conversations.find((c) => c.id === currentId) : null;
+    let existingConv = currentId
+      ? conversations.find((c) => c.id === currentId)
+      : null;
     let baseMessages: Message[] = existingConv?.messages ?? [];
 
     if (!activeId) {
@@ -939,10 +1037,15 @@ export default function Home() {
             body: JSON.stringify({ prompt, model: genModel }),
           });
           if (!res.ok) {
-            const err = await res.json().catch(() => ({ error: res.statusText }));
+            const err = await res
+              .json()
+              .catch(() => ({ error: res.statusText }));
             throw new Error(err.error || `图片生成失败: ${res.status}`);
           }
-          data = (await res.json()) as { imageBase64: string; mimeType: string };
+          data = (await res.json()) as {
+            imageBase64: string;
+            mimeType: string;
+          };
           break;
         } catch (e) {
           lastErr = e instanceof Error ? e : new Error('图片生成失败');
@@ -954,66 +1057,43 @@ export default function Home() {
         throw lastErr ?? new Error('图片生成失败：无可用图像生成模型');
       }
 
-      const imageBase64 = data.imageBase64?.trim();
+      const imageBase64 = data.imageBase64.trim();
       const mimeType = data.mimeType || 'image/png';
       if (!imageBase64) throw new Error('生成结果为空');
 
-      const blob = base64ToBlob(imageBase64, mimeType);
-      const objectUrl = URL.createObjectURL(blob);
-      const id = generateId();
-      const ext = mimeType.includes('jpeg')
-        ? 'jpg'
-        : mimeType.includes('webp')
-          ? 'webp'
-          : mimeType.includes('gif')
-            ? 'gif'
-            : 'png';
-      const doc: DocItem = {
-        id,
-        name: `生成图片_${new Date().toLocaleTimeString()}.${ext}`,
-        content: '',
-        kind: 'img',
-        objectUrl,
-        blob,
-        pages: undefined,
-        checked: true,
-        visionSummary: '',
-        visionStatus: 'none',
-      };
-
-      setDocs((prev) => [doc, ...prev]);
-      setActiveDocId(id);
-
-      void upsertDoc({
-        id: doc.id,
-        name: doc.name,
-        content: doc.content,
-        kind: doc.kind,
-        pages: doc.pages,
-        checked: doc.checked,
-        blob: doc.blob,
-        visionSummary: doc.visionSummary,
-        visionStatus: doc.visionStatus,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      }).catch(() => null);
-
-      // 给对话追加一条说明（不把 base64 写进 messages，避免膨胀 IndexedDB）
       const assistantMsg: Message = {
         role: 'assistant',
-        content: '已生成图片，已加入右侧文档栏（可在需要时保持勾选用于后续对话）。',
+        content: '已根据你的描述生成图片如上：',
+        images: [
+          {
+            mimeType,
+            base64: imageBase64,
+          },
+        ],
       };
 
-      updateConversation(activeId, (c) => ({ ...c, messages: [...c.messages, assistantMsg] }));
+      updateConversation(activeId, (c) => ({
+        ...c,
+        messages: [...c.messages, assistantMsg],
+      }));
 
       const finalMessages = [...baseMessages, assistantMsg];
-      if (finalMessages.length >= 2 && !(existingConv?.titleGenerated ?? false)) {
+      if (
+        finalMessages.length >= 2 &&
+        !(existingConv?.titleGenerated ?? false)
+      ) {
         fetchTitle(activeId, finalMessages);
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : '图片生成出错';
-      const assistantMsg: Message = { role: 'assistant', content: `错误: ${msg}` };
-      updateConversation(activeId!, (c) => ({ ...c, messages: [...c.messages, assistantMsg] }));
+      const assistantMsg: Message = {
+        role: 'assistant',
+        content: `错误: ${msg}`,
+      };
+      updateConversation(activeId!, (c) => ({
+        ...c,
+        messages: [...c.messages, assistantMsg],
+      }));
     }
   };
 
@@ -1105,7 +1185,6 @@ export default function Home() {
               {currentConversation?.title ?? 'My Local AI'}
             </h1>
             <div className="flex items-center gap-2">
-              <ImageGenerateDialog onGenerate={handleGenerateImage} />
               <SettingsDialog
                 model={model}
                 setModel={setModel}

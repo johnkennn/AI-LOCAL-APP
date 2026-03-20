@@ -27,7 +27,12 @@ const SETTINGS_KEY = 'ai-local-app:settings:v1';
 const VISION_MODEL = 'llava';
 
 /** 图片生成模型（Ollama 实验性图像生成，需本机已拉取）。 */
-const IMAGE_GEN_MODELS = ['x/flux2-klein', 'x/z-image-turbo'] as const;
+// 按“更省显存 -> 更高画质”排序，优先避免 OOM。
+const IMAGE_GEN_MODELS = [
+  'x/z-image-turbo:latest',
+  'x/flux2-klein:4b',
+  'x/flux2-klein:latest',
+] as const;
 
 type SettingsState = {
   currentId: string | null;

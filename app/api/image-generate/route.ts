@@ -21,7 +21,7 @@ function guessMimeFromBase64(base64: string) {
 
 export async function POST(req: Request) {
   try {
-    const { prompt, model = 'x/flux2-klein' } = await req.json();
+    const { prompt, model = 'x/z-image-turbo:latest' } = await req.json();
     if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
       return NextResponse.json({ error: 'prompt 不能为空' }, { status: 400 });
     }

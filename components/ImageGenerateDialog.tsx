@@ -48,9 +48,9 @@ export function ImageGenerateDialog({ onGenerate }: ImageGenerateDialogProps) {
         <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-[min(680px,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-xl">
           <Dialog.Description className="sr-only">图片生成面板</Dialog.Description>
           <div className="flex items-center justify-between border-b border-zinc-200 dark:border-zinc-800 px-5 py-4">
-            <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+            <Dialog.Title className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
               图片生成
-            </div>
+            </Dialog.Title>
             <Dialog.Close asChild>
               <button
                 type="button"

@@ -97,6 +97,94 @@ function finalizeStalePipelineProgress(msg: Message): Message {
   };
 }
 
+type VideoAnalysisLite = {
+  summary?: string;
+  timeline?: Array<{
+    startSec: number;
+    endSec: number;
+    event: string;
+    confidence: number;
+  }>;
+  audioSummary?: string;
+  caveats?: string[];
+};
+
+function parseVideoPipelinePromptFromChat(raw: string): string | null {
+  const t = raw.trim();
+  if (!/^分析视频/i.test(t)) return null;
+  const cleaned = t.replace(/^分析视频\s*[:：]?\s*/i, '').trim();
+  return cleaned || '请做完整的音视频综合分析并按时间线输出。';
+}
+
+function parseVideoRecordIdFromChat(raw: string): string | null {
+  const t = raw.trim();
+  if (!/^查询视频记录/i.test(t)) return null;
+  const cleaned = t.replace(/^查询视频记录\s*[:：]?\s*/i, '').trim();
+  return cleaned || null;
+}
+
+function parseImagePromptFromChat(raw: string): string | null {
+  const t = raw.trim();
+  if (!/^生成/i.test(t)) return null;
+  if (!(t.includes('图片') || t.includes('图'))) return null;
+  const cleaned = t
+    .replace(/^生成(图片|图)?\s*[:：]?\s*/i, '')
+    .replace(/^(一张|一幅|一批|一组)\s*/i, '')
+    .replace(/^(图片|图)\s*/i, '')
+    .trim();
+  return cleaned || null;
+}
+
+function formatTimelineText(analysis: VideoAnalysisLite): string {
+  return (analysis.timeline ?? [])
+    .slice(0, 12)
+    .map(
+      (e, idx) =>
+        `${idx + 1}. [${e.startSec.toFixed(1)}s - ${e.endSec.toFixed(1)}s] ${e.event}（置信度 ${(e.confidence * 100).toFixed(0)}%）`,
+    )
+    .join('\n');
+}
+
+function formatCaveatsText(analysis: VideoAnalysisLite): string {
+  return (analysis.caveats ?? []).map((c, idx) => `${idx + 1}. ${c}`).join('\n');
+}
+
+function buildVideoAnalysisMessage(params: {
+  title: string;
+  analysis: VideoAnalysisLite;
+  recordId?: string;
+  createdAt?: string;
+  showCacheHint?: boolean;
+}): string {
+  const timelineText = formatTimelineText(params.analysis);
+  const caveatsText = formatCaveatsText(params.analysis);
+  return [
+    `### ${params.title}`,
+    '',
+    params.recordId ? `记录 ID：${params.recordId}` : '',
+    params.createdAt ? `创建时间：${params.createdAt}` : '',
+    params.showCacheHint ? '缓存键：已生成（后续同参数会优先命中缓存）' : '',
+    params.recordId || params.createdAt || params.showCacheHint ? '' : '',
+    '### 总体摘要',
+    '',
+    params.analysis.summary ?? '无',
+    '',
+    '### 音频摘要',
+    '',
+    params.analysis.audioSummary ?? '无',
+    '',
+    '### 时间线',
+    '',
+    timelineText || '无有效时间线',
+    '',
+    caveatsText ? '### 注意事项' : '',
+    caveatsText ? '' : '',
+    caveatsText,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
 /**
  * 生成稳定的客户端 id（会话/文档等）。
  * 优先使用 crypto.randomUUID；在不支持的环境降级为时间戳+随机串。
@@ -550,40 +638,6 @@ export default function Home() {
     setCurrentId(activeId);
     setIsLoading(true);
 
-    /**
-     * 消息指令：在输入框中触发“综合音视频分析流水线”。
-     * 约定：
-     * - 以“分析视频”开头
-     * - 后面文本作为分析关注点（userPrompt）
-     */
-    const parseVideoPipelinePromptFromChat = (raw: string): string | null => {
-      const t = raw.trim();
-      if (!/^分析视频/i.test(t)) return null;
-      const cleaned = t.replace(/^分析视频\s*[:：]?\s*/i, '').trim();
-      return cleaned || '请做完整的音视频综合分析并按时间线输出。';
-    };
-    const parseVideoRecordIdFromChat = (raw: string): string | null => {
-      const t = raw.trim();
-      if (!/^查询视频记录/i.test(t)) return null;
-      const cleaned = t.replace(/^查询视频记录\s*[:：]?\s*/i, '').trim();
-      return cleaned || null;
-    };
-
-    // 消息指令：在输入框中直接生成图片并插入对话
-    // 约定：以 “生成” 开头，且包含 “图片”/“图”
-    const parseImagePromptFromChat = (raw: string): string | null => {
-      const t = raw.trim();
-      if (!/^生成/i.test(t)) return null;
-      if (!(t.includes('图片') || t.includes('图'))) return null;
-      // 去掉前缀 “生成/生成图片/生成图/冒号”
-      const cleaned = t
-        .replace(/^生成(图片|图)?\s*[:：]?\s*/i, '')
-        .replace(/^(一张|一幅|一批|一组)\s*/i, '')
-        .replace(/^(图片|图)\s*/i, '')
-        .trim();
-      return cleaned ? cleaned : null;
-    };
-
     const recordQueryId = parseVideoRecordIdFromChat(userMessage);
     if (recordQueryId) {
       try {
@@ -617,40 +671,12 @@ export default function Home() {
         const analysis = payload.record?.result?.analysis;
         if (!analysis) throw new Error('记录存在，但缺少 analysis');
 
-        const timelineText = (analysis.timeline ?? [])
-          .slice(0, 12)
-          .map(
-            (e, idx) =>
-              `${idx + 1}. [${e.startSec.toFixed(1)}s - ${e.endSec.toFixed(1)}s] ${e.event}（置信度 ${(e.confidence * 100).toFixed(0)}%）`,
-          )
-          .join('\n');
-        const caveatsText = (analysis.caveats ?? [])
-          .map((c, idx) => `${idx + 1}. ${c}`)
-          .join('\n');
-        const assistantContent = [
-          '### 历史视频分析记录',
-          '',
-          `记录 ID：${payload.record?.id ?? recordQueryId}`,
-          `创建时间：${payload.record?.createdAt ?? '未知'}`,
-          '',
-          '### 总体摘要',
-          '',
-          analysis.summary ?? '无',
-          '',
-          '### 音频摘要',
-          '',
-          analysis.audioSummary ?? '无',
-          '',
-          '### 时间线',
-          '',
-          timelineText || '无有效时间线',
-          '',
-          caveatsText ? '### 注意事项' : '',
-          caveatsText ? '' : '',
-          caveatsText,
-        ]
-          .filter(Boolean)
-          .join('\n');
+        const assistantContent = buildVideoAnalysisMessage({
+          title: '历史视频分析记录',
+          analysis,
+          recordId: payload.record?.id ?? recordQueryId,
+          createdAt: payload.record?.createdAt ?? '未知',
+        });
         const finalMessages: Message[] = [
           ...newMessages,
           { role: 'assistant', content: assistantContent },
@@ -774,43 +800,13 @@ export default function Home() {
           progressTimer = null;
         }
 
-        const timelineText = (analysis.timeline ?? [])
-          .slice(0, 12)
-          .map(
-            (e, idx) =>
-              `${idx + 1}. [${e.startSec.toFixed(1)}s - ${e.endSec.toFixed(1)}s] ${e.event}（置信度 ${(e.confidence * 100).toFixed(0)}%）`,
-          )
-          .join('\n');
-
-        const caveatsText = (analysis.caveats ?? [])
-          .map((c, idx) => `${idx + 1}. ${c}`)
-          .join('\n');
-
-        const assistantContent = [
-          '### 视频综合分析结果',
-          '',
-          `记录 ID：${payload.result?.recordId ?? '无'}`,
-          `创建时间：${payload.result?.createdAt ?? '无'}`,
-          payload.cacheKey ? '缓存键：已生成（后续同参数会优先命中缓存）' : '',
-          '',
-          '### 总体摘要',
-          '',
-          analysis.summary ?? '无',
-          '',
-          '### 音频摘要',
-          '',
-          analysis.audioSummary ?? '无',
-          '',
-          '### 时间线',
-          '',
-          timelineText || '无有效时间线',
-          '',
-          caveatsText ? '### 注意事项' : '',
-          caveatsText ? '' : '',
-          caveatsText,
-        ]
-          .filter(Boolean)
-          .join('\n');
+        const assistantContent = buildVideoAnalysisMessage({
+          title: '视频综合分析结果',
+          analysis,
+          recordId: payload.result?.recordId ?? '无',
+          createdAt: payload.result?.createdAt ?? '无',
+          showCacheHint: !!payload.cacheKey,
+        });
 
         const assistantMsg: Message = {
           role: 'assistant',

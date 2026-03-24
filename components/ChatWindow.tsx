@@ -211,7 +211,7 @@ export function ChatWindow({
               </button>
             </div>
             <div className="text-[11px] text-zinc-400">
-              Enter 发送 · 右侧勾选的文档会注入上下文 · 支持 `生成图片...`
+              Enter 发送 · 右侧勾选的文档会注入上下文 · 支持 `生成图片...` / `分析视频...` / `查询视频记录:jobId`
             </div>
           </div>
         </div>

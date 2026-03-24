@@ -70,6 +70,33 @@ const MODELS = [
   { id: 'llama3.1', name: 'Llama 3.1' },
 ];
 
+// 用于标记“仅在本次运行中有效”的视频流水线进度消息。
+const VIDEO_PIPELINE_PROGRESS_MARKER = '<!--video-pipeline-progress-->';
+
+function isVideoPipelineProgressMessage(msg: Message): boolean {
+  return (
+    msg.role === 'assistant' &&
+    typeof msg.content === 'string' &&
+    msg.content.includes(VIDEO_PIPELINE_PROGRESS_MARKER)
+  );
+}
+
+/**
+ * 刷新/重启后，把“处理中进度消息”改写为可恢复提示，避免用户误以为任务仍在执行。
+ */
+function finalizeStalePipelineProgress(msg: Message): Message {
+  if (!isVideoPipelineProgressMessage(msg)) return msg;
+  return {
+    ...msg,
+    content: [
+      '### 视频综合分析',
+      '',
+      '上一次视频分析任务在页面刷新或中断后未完成。',
+      '该任务不会自动续跑，请重新发送 `分析视频: ...`，或用 `查询视频记录:jobId` 查看已保存结果。',
+    ].join('\n'),
+  };
+}
+
 /**
  * 生成稳定的客户端 id（会话/文档等）。
  * 优先使用 crypto.randomUUID；在不支持的环境降级为时间戳+随机串。
@@ -262,8 +289,17 @@ export default function Home() {
       // 3) 加载会话（IndexedDB）
       const convs = await getAllConversations();
       if (cancelled) return;
-      setConversations(convs);
-      setCurrentId((cur) => cur ?? convs[0]?.id ?? null);
+      const hydratedConvs = convs.map((c) => {
+        const hasProgress = c.messages.some(isVideoPipelineProgressMessage);
+        if (!hasProgress) return c;
+        const messages = c.messages.map(finalizeStalePipelineProgress);
+        const next = { ...c, messages };
+        // 异步回写，避免下次刷新仍停留在旧进度文案
+        void upsertConversation(next).catch(() => null);
+        return next;
+      });
+      setConversations(hydratedConvs);
+      setCurrentId((cur) => cur ?? hydratedConvs[0]?.id ?? null);
 
       // 4) 加载文档（IndexedDB）
       const storedDocs = await getAllDocs();
@@ -361,6 +397,30 @@ export default function Home() {
       if (nextConv) {
         void upsertConversation(nextConv).catch(() => null);
       }
+    },
+    [],
+  );
+
+  /**
+   * 仅更新内存中的会话消息，不写入 IndexedDB。
+   * 用于临时进度态，避免和最终结果持久化发生写入竞态。
+   */
+  const updateConversationEphemeral = useCallback(
+    (id: string, updater: (c: Conversation) => Conversation) => {
+      setConversations((prev) => {
+        const found = prev.find((c) => c.id === id);
+        if (found) {
+          const next = updater(found);
+          return prev.map((c) => (c.id === id ? next : c));
+        }
+        const created: Conversation = {
+          id,
+          title: '新对话',
+          messages: [],
+        };
+        const next = updater(created);
+        return [next, ...prev];
+      });
     },
     [],
   );
@@ -490,6 +550,25 @@ export default function Home() {
     setCurrentId(activeId);
     setIsLoading(true);
 
+    /**
+     * 消息指令：在输入框中触发“综合音视频分析流水线”。
+     * 约定：
+     * - 以“分析视频”开头
+     * - 后面文本作为分析关注点（userPrompt）
+     */
+    const parseVideoPipelinePromptFromChat = (raw: string): string | null => {
+      const t = raw.trim();
+      if (!/^分析视频/i.test(t)) return null;
+      const cleaned = t.replace(/^分析视频\s*[:：]?\s*/i, '').trim();
+      return cleaned || '请做完整的音视频综合分析并按时间线输出。';
+    };
+    const parseVideoRecordIdFromChat = (raw: string): string | null => {
+      const t = raw.trim();
+      if (!/^查询视频记录/i.test(t)) return null;
+      const cleaned = t.replace(/^查询视频记录\s*[:：]?\s*/i, '').trim();
+      return cleaned || null;
+    };
+
     // 消息指令：在输入框中直接生成图片并插入对话
     // 约定：以 “生成” 开头，且包含 “图片”/“图”
     const parseImagePromptFromChat = (raw: string): string | null => {
@@ -504,6 +583,270 @@ export default function Home() {
         .trim();
       return cleaned ? cleaned : null;
     };
+
+    const recordQueryId = parseVideoRecordIdFromChat(userMessage);
+    if (recordQueryId) {
+      try {
+        const res = await fetch(
+          `/api/video-pipeline?jobId=${encodeURIComponent(recordQueryId)}`,
+        );
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ error: res.statusText }));
+          throw new Error(err.error || `查询失败: ${res.status}`);
+        }
+        const payload = (await res.json()) as {
+          ok: boolean;
+          record?: {
+            id: string;
+            createdAt: string;
+            result?: {
+              analysis?: {
+                summary?: string;
+                timeline?: Array<{
+                  startSec: number;
+                  endSec: number;
+                  event: string;
+                  confidence: number;
+                }>;
+                audioSummary?: string;
+                caveats?: string[];
+              };
+            };
+          };
+        };
+        const analysis = payload.record?.result?.analysis;
+        if (!analysis) throw new Error('记录存在，但缺少 analysis');
+
+        const timelineText = (analysis.timeline ?? [])
+          .slice(0, 12)
+          .map(
+            (e, idx) =>
+              `${idx + 1}. [${e.startSec.toFixed(1)}s - ${e.endSec.toFixed(1)}s] ${e.event}（置信度 ${(e.confidence * 100).toFixed(0)}%）`,
+          )
+          .join('\n');
+        const caveatsText = (analysis.caveats ?? [])
+          .map((c, idx) => `${idx + 1}. ${c}`)
+          .join('\n');
+        const assistantContent = [
+          '### 历史视频分析记录',
+          '',
+          `记录 ID：${payload.record?.id ?? recordQueryId}`,
+          `创建时间：${payload.record?.createdAt ?? '未知'}`,
+          '',
+          '### 总体摘要',
+          '',
+          analysis.summary ?? '无',
+          '',
+          '### 音频摘要',
+          '',
+          analysis.audioSummary ?? '无',
+          '',
+          '### 时间线',
+          '',
+          timelineText || '无有效时间线',
+          '',
+          caveatsText ? '### 注意事项' : '',
+          caveatsText ? '' : '',
+          caveatsText,
+        ]
+          .filter(Boolean)
+          .join('\n');
+        const finalMessages: Message[] = [
+          ...newMessages,
+          { role: 'assistant', content: assistantContent },
+        ];
+        updateConversation(activeId, () => ({ ...conv, messages: finalMessages }));
+        if (finalMessages.length >= 2 && !conv.titleGenerated) {
+          fetchTitle(activeId, finalMessages);
+        }
+        return;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : '查询视频记录失败';
+        const errorMessages: Message[] = [
+          ...newMessages,
+          { role: 'assistant', content: `错误: ${msg}` },
+        ];
+        updateConversation(activeId, () => ({ ...conv, messages: errorMessages }));
+        return;
+      } finally {
+        setIsLoading(false);
+      }
+    }
+
+    const videoPipelinePrompt = parseVideoPipelinePromptFromChat(userMessage);
+    if (videoPipelinePrompt) {
+      let progressTimer: ReturnType<typeof setInterval> | null = null;
+      try {
+        const currentVideoDoc = docsRef.current.find(
+          (d) => d.checked && d.kind === 'video' && !!d.blob,
+        );
+        if (!currentVideoDoc?.blob) {
+          throw new Error('请先上传并勾选至少一个视频文件');
+        }
+
+        // 先插入一个进度消息，避免长视频任务期间“无响应”。
+        const progressStages = [
+          '阶段 1/4：视频预处理中（抽帧 + 分离音轨）...',
+          '阶段 2/4：音频转写中（Whisper）...',
+          '阶段 3/4：视觉理解中（VLM）...',
+          '阶段 4/4：音视频融合总结中...',
+        ];
+        let progressIdx = 0;
+        const buildProgressMessage = (stage: string) =>
+          `### 视频综合分析\n\n任务已提交，正在处理。\n\n${stage}\n\n> 长视频可能需要几十秒到数分钟。\n\n${VIDEO_PIPELINE_PROGRESS_MARKER}`;
+
+        const progressMessages: Message[] = [
+          ...newMessages,
+          { role: 'assistant', content: buildProgressMessage(progressStages[0]) },
+        ];
+        updateConversationEphemeral(activeId, () => ({
+          ...conv,
+          messages: progressMessages,
+        }));
+
+        progressTimer = setInterval(() => {
+          progressIdx = Math.min(progressIdx + 1, progressStages.length - 1);
+          const nextMessages: Message[] = [
+            ...newMessages,
+            {
+              role: 'assistant',
+              content: buildProgressMessage(progressStages[progressIdx]),
+            },
+          ];
+          updateConversationEphemeral(activeId, () => ({
+            ...conv,
+            messages: nextMessages,
+          }));
+        }, 4500);
+
+        const form = new FormData();
+        form.append(
+          'video',
+          new File([currentVideoDoc.blob], currentVideoDoc.name, {
+            type: currentVideoDoc.blob.type || 'video/mp4',
+          }),
+        );
+        form.append('userPrompt', videoPipelinePrompt);
+        // 默认参数：更稳妥的时延/质量平衡
+        form.append('frameIntervalSec', '2');
+        form.append('maxFrames', '120');
+        // 兼顾速度与细节：默认分析前 12 帧，必要时可在后端参数上调。
+        form.append('maxFramesForVlm', '12');
+        form.append('whisperModel', 'base');
+        form.append('visionModel', VISION_MODEL);
+
+        const res = await fetch('/api/video-pipeline', {
+          method: 'POST',
+          body: form,
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ error: res.statusText }));
+          throw new Error(err.error || `视频流水线失败: ${res.status}`);
+        }
+
+        const payload = (await res.json()) as {
+          ok: boolean;
+          cacheKey?: string;
+          result?: {
+            recordId?: string;
+            createdAt?: string;
+            analysis?: {
+              summary?: string;
+              timeline?: Array<{
+                startSec: number;
+                endSec: number;
+                event: string;
+                confidence: number;
+              }>;
+              audioSummary?: string;
+              caveats?: string[];
+            };
+          };
+        };
+
+        const analysis = payload.result?.analysis;
+        if (!analysis) {
+          throw new Error('流水线返回缺少 analysis 结果');
+        }
+
+        if (progressTimer) {
+          clearInterval(progressTimer);
+          progressTimer = null;
+        }
+
+        const timelineText = (analysis.timeline ?? [])
+          .slice(0, 12)
+          .map(
+            (e, idx) =>
+              `${idx + 1}. [${e.startSec.toFixed(1)}s - ${e.endSec.toFixed(1)}s] ${e.event}（置信度 ${(e.confidence * 100).toFixed(0)}%）`,
+          )
+          .join('\n');
+
+        const caveatsText = (analysis.caveats ?? [])
+          .map((c, idx) => `${idx + 1}. ${c}`)
+          .join('\n');
+
+        const assistantContent = [
+          '### 视频综合分析结果',
+          '',
+          `记录 ID：${payload.result?.recordId ?? '无'}`,
+          `创建时间：${payload.result?.createdAt ?? '无'}`,
+          payload.cacheKey ? '缓存键：已生成（后续同参数会优先命中缓存）' : '',
+          '',
+          '### 总体摘要',
+          '',
+          analysis.summary ?? '无',
+          '',
+          '### 音频摘要',
+          '',
+          analysis.audioSummary ?? '无',
+          '',
+          '### 时间线',
+          '',
+          timelineText || '无有效时间线',
+          '',
+          caveatsText ? '### 注意事项' : '',
+          caveatsText ? '' : '',
+          caveatsText,
+        ]
+          .filter(Boolean)
+          .join('\n');
+
+        const assistantMsg: Message = {
+          role: 'assistant',
+          content: assistantContent,
+        };
+
+        const finalMessages: Message[] = [...newMessages, assistantMsg].filter(
+          (m) => !isVideoPipelineProgressMessage(m),
+        );
+        updateConversation(activeId, () => ({
+          ...conv,
+          messages: finalMessages,
+        }));
+        if (finalMessages.length >= 2 && !conv.titleGenerated) {
+          fetchTitle(activeId, finalMessages);
+        }
+        return;
+      } catch (e) {
+        if (progressTimer) {
+          clearInterval(progressTimer);
+          progressTimer = null;
+        }
+        const msg = e instanceof Error ? e.message : '视频分析出错';
+        const errorMessages: Message[] = [
+          ...newMessages,
+          { role: 'assistant', content: `错误: ${msg}` },
+        ];
+        updateConversation(activeId, () => ({
+          ...conv,
+          messages: errorMessages.filter((m) => !isVideoPipelineProgressMessage(m)),
+        }));
+        return;
+      } finally {
+        setIsLoading(false);
+      }
+    }
 
     const imagePrompt = parseImagePromptFromChat(userMessage);
     if (imagePrompt) {
@@ -571,6 +914,8 @@ export default function Home() {
           messages: errorMessages,
         }));
         return;
+      } finally {
+        setIsLoading(false);
       }
     }
 
@@ -629,7 +974,11 @@ export default function Home() {
           const usedVideo =
             currentVideoDocs.length > 0 && videoFramesBases.length > 0;
 
-          type VisionMessage = Message & { images?: string[] };
+          type VisionMessage = {
+            role: Message['role'];
+            content: string;
+            images?: string[];
+          };
           const messagesWithImages: VisionMessage[] = newMessages.map(
             (m, i) => {
               const isLastUser =
@@ -644,7 +993,7 @@ export default function Home() {
                   images: combinedImages,
                 };
               }
-              return m;
+              return { role: m.role, content: m.content };
             },
           );
 
@@ -1003,98 +1352,6 @@ export default function Home() {
     }
 
     return frames;
-  };
-
-  /**
-   * 图片生成入口：调用 /api/image-generate，把结果作为 assistant 附件插入对话。
-   * （不写入右侧“文档栏”，从而满足“在消息对话中展示”）
-   */
-  const handleGenerateImage = async (prompt: string) => {
-    if (isLoading) throw new Error('当前正在对话中，请稍后再生成图片');
-
-    let activeId = currentId;
-    let existingConv = currentId
-      ? conversations.find((c) => c.id === currentId)
-      : null;
-    let baseMessages: Message[] = existingConv?.messages ?? [];
-
-    if (!activeId) {
-      existingConv = null;
-      baseMessages = [];
-      activeId = generateId();
-      setCurrentId(activeId);
-    }
-
-    try {
-      let lastErr: Error | null = null;
-      let data: { imageBase64: string; mimeType: string } | null = null;
-
-      for (const genModel of IMAGE_GEN_MODELS) {
-        try {
-          const res = await fetch('/api/image-generate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prompt, model: genModel }),
-          });
-          if (!res.ok) {
-            const err = await res
-              .json()
-              .catch(() => ({ error: res.statusText }));
-            throw new Error(err.error || `图片生成失败: ${res.status}`);
-          }
-          data = (await res.json()) as {
-            imageBase64: string;
-            mimeType: string;
-          };
-          break;
-        } catch (e) {
-          lastErr = e instanceof Error ? e : new Error('图片生成失败');
-          data = null;
-        }
-      }
-
-      if (!data?.imageBase64) {
-        throw lastErr ?? new Error('图片生成失败：无可用图像生成模型');
-      }
-
-      const imageBase64 = data.imageBase64.trim();
-      const mimeType = data.mimeType || 'image/png';
-      if (!imageBase64) throw new Error('生成结果为空');
-
-      const assistantMsg: Message = {
-        role: 'assistant',
-        content: '已根据你的描述生成图片如上：',
-        images: [
-          {
-            mimeType,
-            base64: imageBase64,
-          },
-        ],
-      };
-
-      updateConversation(activeId, (c) => ({
-        ...c,
-        messages: [...c.messages, assistantMsg],
-      }));
-
-      const finalMessages = [...baseMessages, assistantMsg];
-      if (
-        finalMessages.length >= 2 &&
-        !(existingConv?.titleGenerated ?? false)
-      ) {
-        fetchTitle(activeId, finalMessages);
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : '图片生成出错';
-      const assistantMsg: Message = {
-        role: 'assistant',
-        content: `错误: ${msg}`,
-      };
-      updateConversation(activeId!, (c) => ({
-        ...c,
-        messages: [...c.messages, assistantMsg],
-      }));
-    }
   };
 
   // 图片/视频分析仅依赖视觉模型（VLM）。
